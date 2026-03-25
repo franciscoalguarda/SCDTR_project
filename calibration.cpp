@@ -1,4 +1,3 @@
-// calibration.cpp
 #include "calibration.h"
 #include "hardware/flash.h"
 
@@ -15,6 +14,8 @@ float lux_off[ADDR_MAX_NODES];
 
 static unsigned long last_hello_ms = 0;
 static const unsigned long HELLO_PERIOD_MS = 500;
+static const unsigned long BOOT_TIMEOUT_MS = 3000;
+static unsigned long boot_start_ms = 0;
 
 static uint8_t calib_led_node = 1;
 static uint8_t calib_req_node = 1;
@@ -93,13 +94,14 @@ void boot_task() {
             boot_state = BOOT_ANNOUNCE;
             send_hello();
             last_hello_ms = now;
+            boot_start_ms = now;
             break;
         case BOOT_ANNOUNCE:
             if (now - last_hello_ms >= HELLO_PERIOD_MS) {
                 send_hello();
                 last_hello_ms = now;
             }
-            if (num_nodes == ADDR_MAX_NODES) {
+            if (now - boot_start_ms >= BOOT_TIMEOUT_MS) {
                 assign_addresses();
                 boot_state = BOOT_DONE;
                 if (is_hub) {

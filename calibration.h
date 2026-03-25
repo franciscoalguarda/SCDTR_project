@@ -1,4 +1,3 @@
-// calibration.h
 #ifndef CALIBRATION_H
 #define CALIBRATION_H
 
@@ -6,19 +5,19 @@
 #include "can_protocol.h"
 #include "mcp2515.h"
 
-#define BOOT_IDLE      0
-#define BOOT_ANNOUNCE  1
-#define BOOT_DONE      2
+#define BOOT_IDLE 0
+#define BOOT_ANNOUNCE 1
+#define BOOT_DONE 2
 
-#define CALIB_IDLE           0
-#define CALIB_START          1
-#define CALIB_BKG_WAIT       2
+#define CALIB_IDLE 0
+#define CALIB_START 1
+#define CALIB_BKG_WAIT 2
 #define CALIB_WAIT_REPLY_BKG 3
-#define CALIB_LED_ON         4
-#define CALIB_LED_WAIT       5
-#define CALIB_REQ_LUX        6
+#define CALIB_LED_ON 4
+#define CALIB_LED_WAIT 5
+#define CALIB_REQ_LUX 6
 #define CALIB_WAIT_REPLY_LUX 7
-#define CALIB_DONE           8
+#define CALIB_DONE 8
 
 struct NodeInfo {
     uint32_t uid;

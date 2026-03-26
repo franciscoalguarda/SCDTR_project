@@ -1,6 +1,6 @@
 #include <SPI.h>
 #include <mcp2515.h>
-#include "hardware/flash.h" // Necessário para ler o UID da Pico para o Auto-Addressing
+#include "hardware/flash.h"
 
 // ======================================================================
 // --- CAN-BUS / NETWORK CONFIGURATION ---
@@ -45,10 +45,10 @@ const unsigned long CALIB_LED_SETTLE_MS = 2000;
 // ======================================================================
 const int LED_PIN = 15;
 const int DAC_RANGE = 4096;
-float m = -1.0; 
-float b = 6.75;  
+float m = 0.0; 
+float b = 0.0;  
 float background_lux = 0;
-float system_gain = 0.0;  
+float system_gain = 0.0;
 const float h = 0.01; // 100Hz
 
 // Variáveis de Estado (Interface)
@@ -379,7 +379,22 @@ void boot_task() {
     switch (boot_state) {
         case BOOT_IDLE:
             my_uid = get_unique_id();
-            register_node(my_uid); // Regista-se a si própria (num_nodes passa a 1)
+            
+            if (my_uid == 97) {
+                m = -1.0;
+                b = 6.75;
+            } else if (my_uid == 107) {
+                m = -0.87;
+                b = 6.5193;
+            } else if (my_uid == 122) {
+                m = -0.75;
+                b = 7.4;
+            } else {
+                m = -1.0;
+                b = 6.75;
+            }
+
+            register_node(my_uid);
             boot_state = BOOT_ANNOUNCE;
             send_hello();
             last_hello_ms = now;
@@ -387,7 +402,6 @@ void boot_task() {
             break;
             
         case BOOT_ANNOUNCE:
-            // Continua a gritar "Olá" a cada 500ms para sempre, até ver as outras
             if (now - last_hello_ms >= 500) {
                 send_hello(); 
                 last_hello_ms = now;

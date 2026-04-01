@@ -267,6 +267,17 @@ void process_calib_and_network(struct can_frame &canMsg) {
         uint32_t received_uid;
         unsigned char* up = (unsigned char*)&received_uid;
         for(int i = 0; i < 4; i++) up[i] = canMsg.data[3 + i];
+        
+        // If a boot message is received while the network is already running,
+        // it means one of the boards was flashed or reset! We must ALL restart!
+        if (boot_state == BOOT_DONE && received_uid != my_uid) {
+            system_ready = false;
+            boot_state = BOOT_IDLE;
+            num_nodes = 0;
+            myPID.reset();
+            return;
+        }
+        
         register_node(received_uid);
         return;
     }
@@ -409,6 +420,9 @@ void boot_task() {
             my_uid = get_unique_id();
             boot_start_ms = millis();
             
+            Serial.print("\n[SYSTEM] Power ON! My Hardware UID is: ");
+            Serial.println(my_uid);
+            
             if (my_uid == 97) {
                 m = -1.0;
                 b = 6.75;
@@ -436,10 +450,9 @@ void boot_task() {
                 last_hello_ms = now;
             }
             
-            // THE FIX: Only advance when exactly 3 Picos are found!
-            if (num_nodes == MAX_NODES || (now - boot_start_ms >= BOOT_TIMEOUT_MS)) {
+            // THE FIX: Only advance when exactly 3 Picos are found! No timeouts!
+            if (num_nodes == MAX_NODES) {
                 send_hello(); // Give a last shout for the last board that joined to hear
-                //delay(500);   // Wait half a second to stabilize the network
                 assign_addresses(); // Distribute addresses (1, 2 and 3)
                 boot_state = BOOT_DONE;
                 if (is_hub) calib_state = CALIB_START; // Node 1 starts calibration
@@ -720,7 +733,6 @@ void setup() {
 void loop() {
     readCANMessages();
     processUI();
-
     if (boot_state != BOOT_DONE) {
         boot_task();
     } else if (!system_ready) {

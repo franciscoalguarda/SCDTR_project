@@ -1,6 +1,7 @@
 #include <SPI.h>
-#include <mcp2515.h>
+#include "mcp2515.h"
 #include "hardware/flash.h"
+#include "hardware/spi.h"
 #include "pico/mutex.h"
 
 // ======================================================================
@@ -601,24 +602,27 @@ void processUI() {
             case 't': Serial.print("t "); Serial.print(my_addr); Serial.print(" "); Serial.println(millis() / 1000.0); break;
             case 'd': Serial.print("d "); Serial.print(my_addr); Serial.print(" "); Serial.println(background_lux); break;
             case 'p': Serial.print("p "); Serial.print(my_addr); Serial.print(" "); Serial.println(P_max * (current_u / 4095.0), 4); break;
-            case 'E': 
+            case 'E': {
                 mutex_enter_blocking(&data_mutex);
                 float snap_E = E_energy;
                 mutex_exit(&data_mutex);
                 Serial.print("E "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_E, 4); 
                 break;
-            case 'V': 
+            }
+            case 'V': {
                 mutex_enter_blocking(&data_mutex);
                 float snap_V = metrics_count > 0 ? (V_visibility_sum / metrics_count) : 0;
                 mutex_exit(&data_mutex);
                 Serial.print("V "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_V, 4); 
                 break;
-            case 'F': 
+            }
+            case 'F': {
                 mutex_enter_blocking(&data_mutex);
                 float snap_F = metrics_count > 0 ? (F_flicker_sum / metrics_count) : 0;
                 mutex_exit(&data_mutex);
                 Serial.print("F "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_F, 4); 
                 break;
+            }
             case 'U': Serial.print("U "); Serial.print(my_addr); Serial.print(" "); Serial.println(lower_bound_low); break;
             case 'O': Serial.print("O "); Serial.print(my_addr); Serial.print(" "); Serial.println(lower_bound_high); break;
             case 'C': Serial.print("C "); Serial.print(my_addr); Serial.print(" "); Serial.println(energy_cost); break;
@@ -699,7 +703,7 @@ void setup() {
     mutex_init(&data_mutex);
     Serial.begin(115200);
     SPI.begin();
-    mcp2515 = new MCP2515(CAN_CS_PIN);
+    mcp2515 = new MCP2515(spi0, CAN_CS_PIN);
     mcp2515->reset();
     mcp2515->setBitrate(CAN_500KBPS, MCP_8MHZ); 
     mcp2515->setNormalMode();

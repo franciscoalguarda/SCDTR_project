@@ -9,28 +9,28 @@
 const int CAN_CS_PIN = 17; 
 MCP2515* mcp2515; 
 
-// --- AUTO-ADDRESSING & MÁQUINA DE ESTADOS (WAKE-UP) ---
+// --- AUTO-ADDRESSING & STATE MACHINE (WAKE-UP) ---
 enum BootState { BOOT_IDLE, BOOT_ANNOUNCE, BOOT_DONE };
 enum CalibState { CALIB_IDLE, CALIB_START, CALIB_BKG_WAIT, CALIB_LED_ON, CALIB_LED_WAIT, CALIB_REQ_LUX, CALIB_WAIT_REPLY_LUX, CALIB_WAIT_REPLY_BKG, CALIB_DONE };
 
-BootState boot_state = BOOT_IDLE;
-CalibState calib_state = CALIB_IDLE;
-bool system_ready = false; // Só fica true quando a calibração acaba
+volatile BootState boot_state = BOOT_IDLE;
+volatile CalibState calib_state = CALIB_IDLE;
+volatile bool system_ready = false; // Only becomes true when calibration finishes
 
 uint32_t my_uid = 0;
-int my_addr = 0;     // Substitui o antigo MY_NODE_ID (É atribuído sozinho!)
-bool is_hub = false; // A placa que ficar com my_addr == 1 vira hub automaticamente
+int my_addr = 0;     // Replaces the old MY_NODE_ID (Assigned automatically!)
+bool is_hub = false; // The board with my_addr == 1 automatically becomes the hub
 
 const int MAX_NODES = 3;
 int num_nodes = 0;
 uint32_t network_uids[MAX_NODES];
 
-float gain_matrix[MAX_NODES][MAX_NODES]; // A nossa matriz K (Ganhos de Acoplamento)
+float gain_matrix[MAX_NODES][MAX_NODES]; // Our K matrix (Coupling Gains)
 float lux_off[MAX_NODES];                // Background Lux
-float network_lux[MAX_NODES];            // Estado do Lux dos vizinhos em tempo real
+float network_lux[MAX_NODES];            // Real-time Lux state of neighbors
 float network_u[MAX_NODES] = {0.0, 0.0, 0.0};
 
-// Timers para a Máquina de Estados
+// Timers for the State Machine
 unsigned long last_hello_ms = 0;
 const unsigned long HELLO_PERIOD_MS = 500;
 const unsigned long BOOT_TIMEOUT_MS = 3000;
@@ -51,24 +51,24 @@ const int DAC_RANGE = 4096;
 float m = 0.0; 
 float b = 0.0;  
 float background_lux = 0;
-float system_gain = 0.0;
+volatile float system_gain = 0.0;
 const float h = 0.01; // 100Hz
 
-// Variáveis de Estado (Interface)
-bool feedback_enabled = false; // Arranca desligado. Só liga depois da calibração    
-bool anti_windup_enabled = true; 
-float manual_pwm = 0;             
+// State Variables (Interface)
+volatile bool feedback_enabled = false; // Starts disabled. Only turns on after calibration    
+volatile bool anti_windup_enabled = true; 
+volatile float manual_pwm = 0;             
 float current_lux = 0;           
 float current_u = 0;       
 char current_occupancy = 'o';     
 
-// Variáveis da FASE 2 (Tabela 3)
-float lower_bound_low = 10.0;  // Comando 'U'
-float lower_bound_high = 50.0; // Comando 'O'
-float setpoint = lower_bound_high;
-float energy_cost = 1.0;       // Comando 'C'
+// PHASE 2 Variables (Table 3)
+float lower_bound_low = 10.0;  // Command 'U'
+float lower_bound_high = 50.0; // Command 'O'
+volatile float setpoint = lower_bound_high;
+float energy_cost = 1.0;       // Command 'C'
 
-// Buffers e Métricas
+// Buffers and Metrics
 const int buffer_size = 10;
 float lux_buffer[buffer_size];
 int buffer_idx = 0;
@@ -86,7 +86,7 @@ long metrics_count = 0;
 float last_u_1 = 0, last_u_2 = 0;          
 float P_max = 0.05;          
 
-// Protótipos
+// Prototypes
 void printHelpMenu();
 float getFilteredLux(float new_sample);
 float getLux();
@@ -143,7 +143,8 @@ float getLux() {
 }
 
 void updateMetrics(float u, float y, float ref) {
-    float d_k = u / 4095.0; 
+    mutex_enter_blocking(&data_mutex);
+    float d_k = u / 4095.0;
     E_energy += P_max * d_k * h;
     if (y < ref) V_visibility_sum += (ref - y);
     float diff1 = d_k - last_u_1;
@@ -152,6 +153,7 @@ void updateMetrics(float u, float y, float ref) {
     last_u_2 = last_u_1;
     last_u_1 = d_k;
     metrics_count++;
+    mutex_exit(&data_mutex);
 }
 
 // ======================================================================
@@ -175,7 +177,7 @@ bool register_node(uint32_t uid) {
 }
 
 void assign_addresses() {
-    // Ordenar UIDs do menor para o maior
+    // Sort UIDs from lowest to highest
     for (int i = 0; i < num_nodes - 1; i++) {
         for (int j = 0; j < num_nodes - i - 1; j++) {
             if (network_uids[j] > network_uids[j + 1]) {
@@ -185,11 +187,11 @@ void assign_addresses() {
             }
         }
     }
-    // O meu endereço é a minha posição na lista + 1
+    // My address is my position in the list + 1
     for (int i = 0; i < num_nodes; i++) {
         if (network_uids[i] == my_uid) my_addr = i + 1;
     }
-    if (my_addr == 1) is_hub = true; // O Nó 1 vira Hub
+    if (my_addr == 1) is_hub = true; // Node 1 becomes the Hub
     
     Serial.print("\n=== BOOT DONE ===\nMy UID: "); Serial.println(my_uid);
     Serial.print("Assigned Address: NODE "); Serial.println(my_addr);
@@ -201,7 +203,7 @@ void assign_addresses() {
 // ======================================================================
 void sendCANNetworkMsg(char action, char variable, int dest_node, float value) {
   struct can_frame canMsg;
-  canMsg.can_id  = my_addr > 0 ? my_addr : 99; // 99 se ainda não tiver morada
+  canMsg.can_id  = my_addr > 0 ? my_addr : 99; // 99 if no address yet
   canMsg.can_dlc = 7; 
   canMsg.data[0] = action;    
   canMsg.data[1] = variable;  
@@ -210,13 +212,13 @@ void sendCANNetworkMsg(char action, char variable, int dest_node, float value) {
   unsigned char* p = (unsigned char*)&value;
   for(int i = 0; i < 4; i++) canMsg.data[3 + i] = p[i];
   
-  // Envia a mensagem fisicamente para a rede
+  // Sends the message physically to the network
   mcp2515->sendMessage(&canMsg);
 
-  // --- LOOPBACK DE SOFTWARE (A MAGIA!) ---
-  // Como o transceptor CAN não ouve o que ele próprio transmite,
-  // se a mensagem for destinada a nós mesmos (ou a todos),
-  // injetamo-la diretamente no nosso processador!
+  // --- SOFTWARE LOOPBACK (THE MAGIC!) ---
+  // Since the CAN transceiver doesn't hear what it itself transmits,
+  // if the message is destined for ourselves (or broadcast),
+  // we inject it directly into our processor!
   if (dest_node == my_addr || dest_node == 0) {
       process_calib_and_network(canMsg);
   }
@@ -246,10 +248,16 @@ void process_calib_and_network(struct can_frame &canMsg) {
 
     // --- 0. RESTART GLOBAL ('R') ---
     if (action == 'R') {
-        myPID.reset(); E_energy = 0; V_visibility_sum = 0; F_flicker_sum = 0; metrics_count = 0;
+        mutex_enter_blocking(&data_mutex);
+        myPID.reset();
+        E_energy = 0; 
+        V_visibility_sum = 0; 
+        F_flicker_sum = 0; 
+        metrics_count = 0;
+        mutex_exit(&data_mutex);
         background_lux = 0;
         system_ready = false;
-        if (is_hub) calib_state = CALIB_START; // Só o Maestro arranca a nova onda
+        if (is_hub) calib_state = CALIB_START;
         return;
     }
 
@@ -262,7 +270,22 @@ void process_calib_and_network(struct can_frame &canMsg) {
         return;
     }
 
-    if (dest_node != my_addr && dest_node != 0) return; // Ignorar se não for para mim ou broadcast
+    if (dest_node != my_addr && dest_node != 0) return; // Ignore if not for me or broadcast
+
+    // --- HUB MATRIX DISTRIBUTION TO SLAVES ---
+    if (action == 'M') { // M for Matrix
+        int row = variable - '0'; // Convert char '0','1','2' to integer index
+        int col = dest_node - 1; 
+        gain_matrix[row][col] = value;
+        if (row == col && my_addr == dest_node) system_gain = value;
+        return;
+    }
+    if (action == 'B') { // B for Background
+        int idx = dest_node - 1;
+        lux_off[idx] = value;
+        if (my_addr == dest_node) background_lux = value;
+        return;
+    }
 
     // --- 2. CALIBRATION MESSAGES ('c') ---
     if (action == 'c') {
@@ -274,7 +297,7 @@ void process_calib_and_network(struct can_frame &canMsg) {
             if (calib_led_node == 1 && !is_hub && background_lux == 0) background_lux = meas;
             sendCANNetworkMsg('c', 'x', sender_id, meas); 
         } 
-        else if (variable == 'x' && is_hub) { // Resposta de Lux chega ao Hub
+        else if (variable == 'x' && is_hub) { // Lux response arrives at the Hub
             int idx = sender_id - 1;
             if (calib_state == CALIB_WAIT_REPLY_BKG) {
                 if (calib_req_node == sender_id) {
@@ -304,11 +327,11 @@ void process_calib_and_network(struct can_frame &canMsg) {
                 }
             }
         } 
-        else if (variable == 'd') { // Fim da Calibração recebido pelos Slaves
+        else if (variable == 'd') { // Calibration End received by Slaves
             if (!is_hub) {
                 for(int k=0; k<buffer_size; k++) lux_buffer[k] = background_lux;
                 system_ready = true;
-                feedback_enabled = true; // Liga o PID local
+                feedback_enabled = true; // Turn on local PID
             }
         }
         return;
@@ -362,7 +385,7 @@ void process_calib_and_network(struct can_frame &canMsg) {
             else setpoint = 0.0;
         }
     }
-    // QUALQUER placa que receba a resposta de um comando, imprime no ecrã!
+    // ANY board that receives a command response prints it to the screen!
     else if (action == 'd') { 
         Serial.print(variable); Serial.print(" "); Serial.print(sender_id); Serial.print(" "); 
         if (variable == 'o') Serial.println((char)value);
@@ -412,13 +435,13 @@ void boot_task() {
                 last_hello_ms = now;
             }
             
-            // A CORREÇÃO: Só avança quando tiver encontrado exatamente 3 Picos!
+            // THE FIX: Only advance when exactly 3 Picos are found!
             if (num_nodes == MAX_NODES || (now - boot_start_ms >= BOOT_TIMEOUT_MS)) {
-                send_hello(); // Dá um último grito para a última placa que entrou a ouvir
-                //delay(500);   // Espera meio segundo para estabilizar a rede
-                assign_addresses(); // Distribui as moradas (1, 2 e 3)
+                send_hello(); // Give a last shout for the last board that joined to hear
+                //delay(500);   // Wait half a second to stabilize the network
+                assign_addresses(); // Distribute addresses (1, 2 and 3)
                 boot_state = BOOT_DONE;
-                if (is_hub) calib_state = CALIB_START; // O Nó 1 arranca a calibração
+                if (is_hub) calib_state = CALIB_START; // Node 1 starts calibration
             }
             break;
     }
@@ -433,22 +456,22 @@ void calib_task() {
             Serial.println("\n[HUB] Starting Network Calibration...");
             calib_timer = now;
             calib_req_node = 1;
-            calib_state = CALIB_BKG_WAIT; // <-- ATUALIZAR ESTADO PRIMEIRO
-            sendCANNetworkMsg('c', 's', 0, 0); // Broadcast START (Apagar Leds)
+            calib_state = CALIB_BKG_WAIT; // <-- UPDATE STATE FIRST
+            sendCANNetworkMsg('c', 's', 0, 0); // Broadcast START (Turn off LEDs)
             analogWrite(LED_PIN, 0);
             break;
             
         case CALIB_BKG_WAIT:
             if (now - calib_timer >= CALIB_LED_SETTLE_MS) {
-                calib_state = CALIB_WAIT_REPLY_BKG; // <-- ATUALIZAR ESTADO PRIMEIRO
-                sendCANNetworkMsg('c', 'g', calib_req_node, 0); // Pede Background Lux
+                calib_state = CALIB_WAIT_REPLY_BKG; // <-- UPDATE STATE FIRST
+                sendCANNetworkMsg('c', 'g', calib_req_node, 0); // Request Background Lux
             }
             break;
 
         case CALIB_LED_ON:
             calib_timer = now;
             calib_req_node = 1;
-            calib_state = CALIB_LED_WAIT; // <-- ATUALIZAR ESTADO PRIMEIRO
+            calib_state = CALIB_LED_WAIT; // <-- UPDATE STATE FIRST
             if (calib_led_node == my_addr) analogWrite(LED_PIN, 4095);
             else sendCANNetworkMsg('c', 'l', calib_led_node, 0); 
             break;
@@ -460,31 +483,42 @@ void calib_task() {
             break;
 
         case CALIB_REQ_LUX:
-            calib_state = CALIB_WAIT_REPLY_LUX; // <-- ATUALIZAR ESTADO PRIMEIRO
+            calib_state = CALIB_WAIT_REPLY_LUX; // <-- UPDATE STATE FIRST
             sendCANNetworkMsg('c', 'g', calib_req_node, 0); 
             break;
 
         case CALIB_DONE:
-            calib_state = CALIB_IDLE; // <-- ATUALIZAR ESTADO PRIMEIRO
-            sendCANNetworkMsg('c', 'd', 0, 0); // Broadcast DONE
+            calib_state = CALIB_IDLE; 
             
+            // Hub saves its own values
             system_gain = gain_matrix[my_addr - 1][my_addr - 1];
             background_lux = lux_off[my_addr - 1];
             for(int k=0; k<buffer_size; k++) lux_buffer[k] = background_lux;
             
             Serial.println("\n=== CALIBRATION MATRIX (K) ===");
             for(int i=0; i<num_nodes; i++) {
+                // Transmits background lux to the network (Node i+1)
+                sendCANNetworkMsg('B', '0', i+1, lux_off[i]);
+                
                 for(int j=0; j<num_nodes; j++) {
-                    Serial.print("K"); Serial.print(i+1); Serial.print(j+1); Serial.print(": ");
+                    Serial.print("K");
+                    Serial.print(i+1); Serial.print(j+1); Serial.print(": ");
                     Serial.print(gain_matrix[i][j], 6); Serial.print("\t");
+                    
+                    // Transmits cross-gain to the correct destination
+                    sendCANNetworkMsg('M', '0' + i, j+1, gain_matrix[i][j]);
                 }
                 Serial.println();
             }
             Serial.println("==============================");
             printHelpMenu();
             
+            delay(200); // Give a moment for the CAN network to digest all these messages
+            
+            sendCANNetworkMsg('c', 'd', 0, 0); // Broadcast DONE (Now Slaves can start)
+            
             system_ready = true;
-            feedback_enabled = true; // Inicia PID do Hub
+            feedback_enabled = true; // Starts Hub PID
             break;
     }
 }
@@ -535,7 +569,7 @@ void processUI() {
     if (cmd == 'h' || cmd == '?') { printHelpMenu(); return; }
 
     if (cmd == 'R') { 
-      sendCANNetworkMsg('R', 'R', 0, 0); // Grita para a rede toda recomeçar
+      sendCANNetworkMsg('R', 'R', 0, 0); // Shout to the whole network to restart
       Serial.println("ack"); return;
     }
 
@@ -545,9 +579,21 @@ void processUI() {
       int target_node = input.substring(4).toInt(); 
       if (target_node == my_addr) {
           switch (subcmd) {
-            case 'u': Serial.print("u "); Serial.print(my_addr); Serial.print(" "); Serial.println(current_u); break;
+            case 'u': {
+                mutex_enter_blocking(&data_mutex);
+                float snap_u = current_u;
+                mutex_exit(&data_mutex);
+                Serial.print("u "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_u); 
+                break;
+            }
             case 'r': Serial.print("r "); Serial.print(my_addr); Serial.print(" "); Serial.println(setpoint); break;
-            case 'y': Serial.print("y "); Serial.print(my_addr); Serial.print(" "); Serial.println(current_lux); break;
+            case 'y': {
+                mutex_enter_blocking(&data_mutex);
+                float snap_y = current_lux;
+                mutex_exit(&data_mutex);
+                Serial.print("y "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_y); 
+                break;
+            }
             case 'a': Serial.print("a "); Serial.print(my_addr); Serial.print(" "); Serial.println(anti_windup_enabled); break;
             case 'f': Serial.print("f "); Serial.print(my_addr); Serial.print(" "); Serial.println(feedback_enabled); break;
             case 'o': Serial.print("o "); Serial.print(my_addr); Serial.print(" "); Serial.println(current_occupancy); break;
@@ -555,9 +601,24 @@ void processUI() {
             case 't': Serial.print("t "); Serial.print(my_addr); Serial.print(" "); Serial.println(millis() / 1000.0); break;
             case 'd': Serial.print("d "); Serial.print(my_addr); Serial.print(" "); Serial.println(background_lux); break;
             case 'p': Serial.print("p "); Serial.print(my_addr); Serial.print(" "); Serial.println(P_max * (current_u / 4095.0), 4); break;
-            case 'E': Serial.print("E "); Serial.print(my_addr); Serial.print(" "); Serial.println(E_energy, 4); break;
-            case 'V': Serial.print("V "); Serial.print(my_addr); Serial.print(" "); Serial.println(metrics_count > 0 ? (V_visibility_sum / metrics_count) : 0, 4); break;
-            case 'F': Serial.print("F "); Serial.print(my_addr); Serial.print(" "); Serial.println(metrics_count > 0 ? (F_flicker_sum / metrics_count) : 0, 4); break;
+            case 'E': 
+                mutex_enter_blocking(&data_mutex);
+                float snap_E = E_energy;
+                mutex_exit(&data_mutex);
+                Serial.print("E "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_E, 4); 
+                break;
+            case 'V': 
+                mutex_enter_blocking(&data_mutex);
+                float snap_V = metrics_count > 0 ? (V_visibility_sum / metrics_count) : 0;
+                mutex_exit(&data_mutex);
+                Serial.print("V "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_V, 4); 
+                break;
+            case 'F': 
+                mutex_enter_blocking(&data_mutex);
+                float snap_F = metrics_count > 0 ? (F_flicker_sum / metrics_count) : 0;
+                mutex_exit(&data_mutex);
+                Serial.print("F "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_F, 4); 
+                break;
             case 'U': Serial.print("U "); Serial.print(my_addr); Serial.print(" "); Serial.println(lower_bound_low); break;
             case 'O': Serial.print("O "); Serial.print(my_addr); Serial.print(" "); Serial.println(lower_bound_high); break;
             case 'C': Serial.print("C "); Serial.print(my_addr); Serial.print(" "); Serial.println(energy_cost); break;
@@ -595,9 +656,9 @@ void processUI() {
     if (sS == -1 && fS != -1) {
       float val = input.substring(fS + 1).toFloat();
       switch(cmd) {
-        case 'p': myPID.setKp(val); Serial.println("ack"); break;
-        case 'i': myPID.setKi(val); Serial.println("ack"); break;
-        case 'd': myPID.setKd(val); Serial.println("ack"); break;
+        case 'p': mutex_enter_blocking(&data_mutex); myPID.setKp(val); mutex_exit(&data_mutex); Serial.println("ack"); break;
+        case 'i': mutex_enter_blocking(&data_mutex); myPID.setKi(val); mutex_exit(&data_mutex); Serial.println("ack"); break;
+        case 'd': mutex_enter_blocking(&data_mutex); myPID.setKd(val); mutex_exit(&data_mutex); Serial.println("ack"); break;
       }
       return;
     } 
@@ -649,7 +710,7 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     analogWrite(LED_PIN, 0); 
 
-    boot_state = BOOT_IDLE; // Inicia a máquina de estados
+    boot_state = BOOT_IDLE; // Starts the state machine
 }
 
 void loop() {
@@ -661,19 +722,23 @@ void loop() {
     } else if (!system_ready) {
         calib_task();
     } else {
-        // Broadcast a 1Hz — lê as variáveis partilhadas com protecção
         static unsigned long last_bc = 0;
-        if (millis() - last_bc >= 1000) {
-            last_bc = millis();
+        static int hist_cnt = 0;
+        if (millis() - last_bc >= 100) {
+            last_bc += 100;
             mutex_enter_blocking(&data_mutex);
             float lux_snap = current_lux;
-            float u_snap   = current_u;
+            float u_snap = current_u;
             mutex_exit(&data_mutex);
-            sendCANNetworkMsg('b', 'y', 0, lux_snap);
-            sendCANNetworkMsg('b', 'u', 0, u_snap);
             history_y[history_idx] = lux_snap;
             history_u[history_idx] = u_snap;
             history_idx = (history_idx + 1) % minute_buffer_size;
+            hist_cnt++;
+            if (hist_cnt >= 10) {
+                hist_cnt = 0;
+                sendCANNetworkMsg('b', 'y', 0, lux_snap);
+                sendCANNetworkMsg('b', 'u', 0, u_snap);
+            }
         }
     }
 }
@@ -691,15 +756,31 @@ void loop1() {
     static unsigned long last_t = 0;
     unsigned long now = millis();
     if (now - last_t < 10) return;  // 100 Hz
-    last_t = now;
+    last_t += 10;
 
-    // Mede LUX
+    // Measure LUX
     float lux = getFilteredLux(getLux());
 
-    // Calcula controlo
+    // Calculate control
     float u = 0.0f;
     if (feedback_enabled) {
-        u = myPID.compute(setpoint, lux, anti_windup_enabled);
+        float external_illuminance = 0.0;
+        for (int j = 0; j < num_nodes; j++) {
+            if (j != (my_addr - 1)) {
+                external_illuminance += gain_matrix[j][my_addr - 1] * network_u[j];
+            }
+        }
+        
+        float pid_output;
+        mutex_enter_blocking(&data_mutex);
+        pid_output = myPID.compute(setpoint, lux, anti_windup_enabled);
+        mutex_exit(&data_mutex);
+        
+        float ff_pwm = external_illuminance / system_gain;
+        u = pid_output - ff_pwm;
+        
+        if (u > 4095.0) u = 4095.0;
+        else if (u < 0.0) u = 0.0;
     } else {
         u = manual_pwm;
     }
@@ -707,7 +788,7 @@ void loop1() {
     analogWrite(LED_PIN, (int)u);
     updateMetrics(u, lux, setpoint);
 
-    // Actualiza variáveis partilhadas com protecção
+    // Update shared variables with protection
     mutex_enter_blocking(&data_mutex);
     current_lux = lux;
     current_u   = u;

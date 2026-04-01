@@ -36,6 +36,7 @@ unsigned long last_hello_ms = 0;
 const unsigned long HELLO_PERIOD_MS = 500;
 const unsigned long BOOT_TIMEOUT_MS = 3000;
 unsigned long boot_start_ms = 0;
+unsigned long boot_done_time = 0;
 
 int calib_led_node = 1;
 int calib_req_node = 1;
@@ -262,15 +263,15 @@ void process_calib_and_network(struct can_frame &canMsg) {
         return;
     }
 
-    // --- 1. BOOT MESSAGES ('w') ---
+        // --- 1. BOOT MESSAGES ('w') ---
     if (action == 'w' && variable == 'h') {
         uint32_t received_uid;
         unsigned char* up = (unsigned char*)&received_uid;
         for(int i = 0; i < 4; i++) up[i] = canMsg.data[3 + i];
         
-        // If a boot message is received while the network is already running,
-        // it means one of the boards was flashed or reset! We must ALL restart!
-        if (system_ready && received_uid != my_uid) {
+        // Se as placas já terminaram o BOOT há mais de 2s e virem alguem novo a iniciar, recomeçam.
+        // Ignora ecos e resets imediatamente a seguir a BOOT_DONE. Protege ambos casos e deadlocks!
+        if (boot_state == BOOT_DONE && (millis() - boot_done_time > 2000) && received_uid != my_uid) {
             system_ready = false;
             boot_state = BOOT_IDLE;
             calib_state = CALIB_IDLE;
@@ -459,6 +460,7 @@ void boot_task() {
                 send_hello(); // Give a last shout for the last board that joined to hear
                 assign_addresses(); // Distribute addresses (1, 2 and 3)
                 boot_state = BOOT_DONE;
+                boot_done_time = millis(); // Guarda a hora a que terminou para bloquear resets ecoados
                 if (is_hub) calib_state = CALIB_START; // Node 1 starts calibration
             }
             break;
@@ -483,6 +485,14 @@ void calib_task() {
             if (now - calib_timer >= CALIB_LED_SETTLE_MS) {
                 calib_state = CALIB_WAIT_REPLY_BKG; // <-- UPDATE STATE FIRST
                 sendCANNetworkMsg('c', 'g', calib_req_node, 0); // Request Background Lux
+                calib_timer = now;
+            }
+            break;
+            
+        case CALIB_WAIT_REPLY_BKG:
+            if (now - calib_timer >= 1000) { // SAFETY TIMEOUT: Se a board 2/3 não acusa CAN, pergunta de novo!
+                sendCANNetworkMsg('c', 'g', calib_req_node, 0); 
+                calib_timer = now;
             }
             break;
 
@@ -503,6 +513,14 @@ void calib_task() {
         case CALIB_REQ_LUX:
             calib_state = CALIB_WAIT_REPLY_LUX; // <-- UPDATE STATE FIRST
             sendCANNetworkMsg('c', 'g', calib_req_node, 0); 
+            calib_timer = now;
+            break;
+            
+        case CALIB_WAIT_REPLY_LUX:
+            if (now - calib_timer >= 1000) { // SAFETY TIMEOUT: Mesma coisa para o Lux com o LED on!
+                sendCANNetworkMsg('c', 'g', calib_req_node, 0); 
+                calib_timer = now;
+            }
             break;
 
         case CALIB_DONE:
@@ -692,7 +710,7 @@ void processUI() {
       if (target_node == my_addr) {
           switch (cmd) {
             case 'r': setpoint = val; Serial.println("ack"); break;
-            case 'u': manual_pwm = (val / 100.0) * 4095.0; feedback_enabled = false; Serial.println("ack"); break;
+            case 'u': manual_pwm = val; feedback_enabled = false; Serial.println("ack"); break; // Retificação do valor para PWM (0-4095)
             case 'f': feedback_enabled = (val > 0); if(!feedback_enabled) manual_pwm = current_u; Serial.println("ack"); break;
             case 'a': anti_windup_enabled = (val > 0); Serial.println("ack"); break;
             case 'o': 

@@ -192,7 +192,7 @@ void assign_addresses() {
     for (int i = 0; i < num_nodes; i++) {
         if (network_uids[i] == my_uid) my_addr = i + 1;
     }
-    if (my_addr == 1) is_hub = true; // Node 1 becomes the Hub
+    is_hub = (my_addr == 1); // Node 1 becomes the Hub
     
     Serial.print("\n=== BOOT DONE ===\nMy UID: "); Serial.println(my_uid);
     Serial.print("Assigned Address: NODE "); Serial.println(my_addr);
@@ -273,8 +273,12 @@ void process_calib_and_network(struct can_frame &canMsg) {
         if (boot_state == BOOT_DONE && received_uid != my_uid) {
             system_ready = false;
             boot_state = BOOT_IDLE;
+            calib_state = CALIB_IDLE;
             num_nodes = 0;
+            is_hub = false;
+            mutex_enter_blocking(&data_mutex);
             myPID.reset();
+            mutex_exit(&data_mutex);
             return;
         }
         

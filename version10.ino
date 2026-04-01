@@ -270,7 +270,7 @@ void process_calib_and_network(struct can_frame &canMsg) {
         
         // If a boot message is received while the network is already running,
         // it means one of the boards was flashed or reset! We must ALL restart!
-        if (boot_state == BOOT_DONE && received_uid != my_uid) {
+        if (system_ready && received_uid != my_uid) {
             system_ready = false;
             boot_state = BOOT_IDLE;
             calib_state = CALIB_IDLE;
@@ -796,7 +796,10 @@ void loop1() {
         pid_output = myPID.compute(setpoint, lux, anti_windup_enabled);
         mutex_exit(&data_mutex);
         
-        float ff_pwm = external_illuminance / system_gain;
+        float ff_pwm = 0.0;
+        if (system_gain > 0.001f) { // Prevents division by zero
+            ff_pwm = external_illuminance / system_gain;
+        }
         u = pid_output - ff_pwm;
         
         if (u > 4095.0) u = 4095.0;

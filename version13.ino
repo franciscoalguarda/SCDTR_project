@@ -55,8 +55,11 @@ bool stream_active_u[MAX_NODES + 1] = {false};
 // ======================================================================
 const int LED_PIN = 15;
 const int DAC_RANGE = 4096;
+
+// VALORES DE CALIBRAÇÃO (Ajustados dinamicamente no boot_task)
 float m = 0.0; 
 float b = 0.0;  
+
 float background_lux = 0;
 volatile float system_gain = 0.0;
 const float h = 0.01; // 100Hz
@@ -385,7 +388,7 @@ void process_calib_and_network(struct can_frame &canMsg) {
         if (variable == 'y' && dest_node == my_addr) { stream_active_y[my_addr] = true; }
         else if (variable == 'u' && dest_node == my_addr) { stream_active_u[my_addr] = true; }
         else if (variable == 'r') setpoint = value;
-        else if (variable == 'u') { manual_pwm = (value / 100.0) * 4095.0; feedback_enabled = false; }
+        else if (variable == 'u') { manual_pwm = value; feedback_enabled = false; }
         else if (variable == 'f') feedback_enabled = (value > 0);
         else if (variable == 'a') anti_windup_enabled = (value > 0);
         else if (variable == 'U') lower_bound_low = value;
@@ -435,6 +438,7 @@ void boot_task() {
         case BOOT_IDLE:
             my_uid = get_unique_id();
             
+            // --- ATENÇÃO: SUBSTITUI AQUI PELOS VALORES REAIS DAS TUAS PLACAS ---
             if (my_uid == 97) { m = -1.0; b = 6.75; } 
             else if (my_uid == 107) { m = -1.0; b = 6.75; } 
             else if (my_uid == 122) { m = -1.0; b = 6.75; } 
@@ -698,7 +702,7 @@ void executeCommand(String input) {
           mutex_enter_blocking(&data_mutex);
           switch (cmd) {
             case 'r': setpoint = val; Serial.println("ack"); break;
-            case 'u': manual_pwm = (val / 100.0) * 4095.0; feedback_enabled = false; Serial.println("ack"); break;
+            case 'u': manual_pwm = val; feedback_enabled = false; Serial.println("ack"); break;
             case 'f': feedback_enabled = (val > 0); if(!feedback_enabled) manual_pwm = current_u; Serial.println("ack"); break;
             case 'a': anti_windup_enabled = (val > 0); Serial.println("ack"); break;
             case 'o': 
@@ -720,10 +724,14 @@ void executeCommand(String input) {
 }
 
 String serialBuffer = "";
+unsigned long last_serial_rx_time = 0;
 
 void processUI() {
+    // Lê os caracteres super rápido e liberta logo o processador
     while (Serial.available() > 0) {
         char c = Serial.read();
+        last_serial_rx_time = millis(); 
+        
         if (c == '\n' || c == '\r') {
             if (serialBuffer.length() > 0) {
                 String input = serialBuffer;
@@ -735,6 +743,16 @@ void processUI() {
             }
         } else {
             serialBuffer += c;
+        }
+    }
+
+    // TIMEOUT DE SEGURANÇA: Se passaram 500ms desde a última letra, assume comando finalizado
+    if (serialBuffer.length() > 0 && (millis() - last_serial_rx_time > 500)) {
+        String input = serialBuffer;
+        serialBuffer = ""; 
+        input.trim();
+        if (input.length() > 0) {
+            executeCommand(input); 
         }
     }
 }

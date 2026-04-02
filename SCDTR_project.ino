@@ -41,6 +41,13 @@ unsigned long calib_timer = 0;
 const unsigned long CALIB_LED_SETTLE_MS = 2000;
 
 // ======================================================================
+// --- STREAMING STATE ---
+// Tracks which variable/node combos are currently streaming
+// ======================================================================
+bool stream_active_y[MAX_NODES + 1] = {false}; // index = node addr (1-based)
+bool stream_active_u[MAX_NODES + 1] = {false};
+
+// ======================================================================
 // --- LOCAL LUMINAIRE CONFIGURATION (PHASE 1) ---
 // ======================================================================
 const int LED_PIN = 15;
@@ -222,6 +229,19 @@ void sendCANNetworkMsg(char action, char variable, int dest_node, float value) {
   }
 }
 
+// Special sender for UID (uint32_t, not float)
+void sendCANUidMsg(int dest_node, uint32_t uid_val) {
+  struct can_frame canMsg;
+  canMsg.can_id  = my_addr > 0 ? my_addr : 99;
+  canMsg.can_dlc = 7;
+  canMsg.data[0] = 'd';   // reply action
+  canMsg.data[1] = 'I';   // 'I' = ID reply
+  canMsg.data[2] = dest_node;
+  unsigned char* p = (unsigned char*)&uid_val;
+  for(int i = 0; i < 4; i++) canMsg.data[3 + i] = p[i];
+  mcp2515->sendMessage(&canMsg);
+}
+
 void send_hello() {
   struct can_frame canMsg;
   canMsg.can_id  = 99; 
@@ -249,6 +269,8 @@ void process_calib_and_network(struct can_frame &canMsg) {
         myPID.reset(); E_energy = 0; V_visibility_sum = 0; F_flicker_sum = 0; metrics_count = 0;
         background_lux = 0;
         system_ready = false;
+        // Clear all streams on restart
+        for(int k = 0; k <= MAX_NODES; k++) { stream_active_y[k] = false; stream_active_u[k] = false; }
         if (is_hub) calib_state = CALIB_START; // Only Master triggers new wave
         return;
     }
@@ -321,6 +343,14 @@ void process_calib_and_network(struct can_frame &canMsg) {
     }
 
     if (action == 'g') {
+        // Handle identity request
+        if (variable == 'I') {
+            // Send addr as float + uid separately via uid sender
+            sendCANNetworkMsg('d', 'A', sender_id, (float)my_addr); // addr
+            sendCANUidMsg(sender_id, my_uid);                        // uid
+            return;
+        }
+
         float reply_val = 0;
         switch(variable) {
             case 'y': reply_val = current_lux; break;
@@ -348,6 +378,10 @@ void process_calib_and_network(struct can_frame &canMsg) {
         sendCANNetworkMsg('d', variable, sender_id, reply_val);
     }
     else if (action == 's') {
+        // Start stream command — 's' action with variable 'y' or 'u'
+        if (variable == 'y' && dest_node == my_addr) { stream_active_y[my_addr] = true; return; }
+        if (variable == 'u' && dest_node == my_addr) { stream_active_u[my_addr] = true; return; }
+
         if (variable == 'r') setpoint = value;
         else if (variable == 'u') { manual_pwm = value; feedback_enabled = false; }
         else if (variable == 'f') feedback_enabled = (value > 0);
@@ -362,8 +396,26 @@ void process_calib_and_network(struct can_frame &canMsg) {
             else setpoint = 0.0;
         }
     }
+    // Stop stream command — 'S' action
+    else if (action == 'S') {
+        if (variable == 'y' && dest_node == my_addr) { stream_active_y[my_addr] = false; return; }
+        if (variable == 'u' && dest_node == my_addr) { stream_active_u[my_addr] = false; return; }
+    }
     // ANY board that receives a command reply prints to Serial!
     else if (action == 'd') { 
+        // Pretty-print the identity reply
+        if (variable == 'A') {
+            Serial.print("id addr "); Serial.print(sender_id); Serial.print(" -> NODE "); Serial.println((int)value);
+            return;
+        }
+        if (variable == 'I') {
+            uint32_t uid_recv;
+            unsigned char* up = (unsigned char*)&uid_recv;
+            for(int i = 0; i < 4; i++) up[i] = canMsg.data[3 + i];
+            Serial.print("id uid  "); Serial.print(sender_id); Serial.print(" -> "); Serial.println(uid_recv);
+            return;
+        }
+
         Serial.print(variable); Serial.print(" "); Serial.print(sender_id); Serial.print(" "); 
         if (variable == 'o') Serial.println((char)value);
         else Serial.println(value, 4);
@@ -518,6 +570,12 @@ void printHelpMenu() {
   Serial.println("  g F <node>     : Get Mean Flicker Error");
   Serial.println("  g L <node>     : Get Current Lower Bound");
   Serial.println("  g C <node>     : Get Energy Cost");
+  Serial.println("  g id <node>    : Get UID and Address of node"); 
+  Serial.println("\n--- STREAM COMMANDS ---");                      
+  Serial.println("  s y <node>     : Start streaming LUX of node");   
+  Serial.println("  s u <node>     : Start streaming PWM of node");   
+  Serial.println("  S y <node>     : Stop streaming LUX of node");    
+  Serial.println("  S u <node>     : Stop streaming PWM of node");    
   Serial.println("\n--- LOCAL COMMANDS ---");
   Serial.println("  p <val>        : Set Kp (Local)");
   Serial.println("  i <val>        : Set Ki (Local)");
@@ -543,6 +601,21 @@ void processUI() {
     // GET COMMANDS
     if (cmd == 'g') {
       char subcmd = input.charAt(2);
+      
+      // Handle 'g id <node>' — request identity from a node
+      if (subcmd == 'i' && input.charAt(3) == 'd') {
+        int target_node = input.substring(5).toInt();
+        if (target_node == my_addr) {
+          // Answer locally
+          Serial.print("id addr "); Serial.print(my_addr); Serial.print(" -> NODE "); Serial.println(my_addr);
+          Serial.print("id uid  "); Serial.print(my_addr); Serial.print(" -> "); Serial.println(my_uid);
+        } else {
+          // Ask remote node via CAN
+          sendCANNetworkMsg('g', 'I', target_node, 0.0);
+        }
+        return;
+      }
+
       int target_node = input.substring(4).toInt(); 
       if (target_node == my_addr) {
           switch (subcmd) {
@@ -586,6 +659,41 @@ void processUI() {
       } else {
           if (subcmd == 'b') Serial.println("err: buffer too large for CAN");
           else sendCANNetworkMsg('g', subcmd, target_node, 0.0);
+      }
+      return;
+    }
+
+    // STREAM START — 's y <node>' / 's u <node>'
+    if (cmd == 's' && (input.charAt(2) == 'y' || input.charAt(2) == 'u')) {
+      char var = input.charAt(2);
+      int target_node = input.substring(4).toInt();
+      if (target_node == my_addr) {
+        if (var == 'y') stream_active_y[my_addr] = true;
+        else            stream_active_u[my_addr] = true;
+        Serial.println("ack");
+      } else {
+        sendCANNetworkMsg('s', var, target_node, 0.0); // Tell remote to start streaming
+        // Track locally that we expect stream from that node
+        if (var == 'y') stream_active_y[target_node] = true;
+        else            stream_active_u[target_node] = true;
+        Serial.println("ack");
+      }
+      return;
+    }
+
+    // STREAM STOP — 'S y <node>' / 'S u <node>'
+    if (cmd == 'S') {
+      char var = input.charAt(2);
+      int target_node = input.substring(4).toInt();
+      if (target_node == my_addr) {
+        if (var == 'y') stream_active_y[my_addr] = false;
+        else            stream_active_u[my_addr] = false;
+        Serial.println("ack");
+      } else {
+        sendCANNetworkMsg('S', var, target_node, 0.0);
+        if (var == 'y') stream_active_y[target_node] = false;
+        else            stream_active_u[target_node] = false;
+        Serial.println("ack");
       }
       return;
     }
@@ -714,6 +822,19 @@ void loop() {
           
           sendCANNetworkMsg('b', 'y', 0, current_lux);
           sendCANNetworkMsg('b', 'u', 0, current_u); // Transmit u for neighbors' feedforward
+          
+          // Emit stream data if streaming is active for this node
+          if (stream_active_y[my_addr]) {
+            Serial.print("s y "); Serial.print(my_addr); 
+            Serial.print(" "); Serial.print(current_lux, 4);
+            Serial.print(" "); Serial.println(millis());
+          }
+          if (stream_active_u[my_addr]) {
+            Serial.print("s u "); Serial.print(my_addr); 
+            Serial.print(" "); Serial.print(current_u, 4);
+            Serial.print(" "); Serial.println(millis());
+          }
+
           history_counter = 0;
         }
       }

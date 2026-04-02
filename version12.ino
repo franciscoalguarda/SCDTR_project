@@ -44,6 +44,7 @@ unsigned long calib_timer = 0;
 const unsigned long CALIB_LED_SETTLE_MS = 2000;
 
 mutex_t data_mutex;
+mutex_t metrics_mutex;
 
 // ======================================================================
 // --- LOCAL LUMINAIRE CONFIGURATION (FASE 1) ---
@@ -53,13 +54,13 @@ const int DAC_RANGE = 4096;
 float m = 0.0; 
 float b = 0.0;  
 float background_lux = 0;
-volatile float system_gain = 0.0;
+float system_gain = 0.0;
 const float h = 0.01; // 100Hz
 
 // State Variables (Interface)
-volatile bool feedback_enabled = false; // Starts disabled. Only turns on after calibration    
-volatile bool anti_windup_enabled = true; 
-volatile float manual_pwm = 0;             
+bool feedback_enabled = false;  // Starts disabled. Only turns on after calibration
+bool anti_windup_enabled = true; 
+float manual_pwm = 0;             
 float current_lux = 0;           
 float current_u = 0;       
 char current_occupancy = 'o';     
@@ -67,7 +68,7 @@ char current_occupancy = 'o';
 // PHASE 2 Variables (Table 3)
 float lower_bound_low = 10.0;  // Command 'U'
 float lower_bound_high = 50.0; // Command 'O'
-volatile float setpoint = lower_bound_high;
+float setpoint = lower_bound_high;
 float energy_cost = 1.0;       // Command 'C'
 
 // Phase 2 Optimization Variables
@@ -152,7 +153,7 @@ float getLux() {
 }
 
 void updateMetrics(float u, float y, float ref) {
-    mutex_enter_blocking(&data_mutex);
+    mutex_enter_blocking(&metrics_mutex);
     float d_k = u / 4095.0;
     E_energy += P_max * d_k * h;
     if (y < ref) V_visibility_sum += (ref - y);
@@ -162,7 +163,7 @@ void updateMetrics(float u, float y, float ref) {
     last_u_2 = last_u_1;
     last_u_1 = d_k;
     metrics_count++;
-    mutex_exit(&data_mutex);
+    mutex_exit(&metrics_mutex);
 }
 
 // ======================================================================
@@ -259,11 +260,15 @@ void process_calib_and_network(struct can_frame &canMsg) {
     if (action == 'R') {
         mutex_enter_blocking(&data_mutex);
         myPID.reset();
+        mutex_exit(&data_mutex);
+        
+        mutex_enter_blocking(&metrics_mutex);
         E_energy = 0; 
         V_visibility_sum = 0; 
         F_flicker_sum = 0; 
         metrics_count = 0;
-        mutex_exit(&data_mutex);
+        mutex_exit(&metrics_mutex);
+        
         background_lux = 0;
         system_ready = false;
         if (is_hub) calib_state = CALIB_START;
@@ -621,10 +626,15 @@ void printHelpMenu() {
 }
 
 void processUI() {
-  if (Serial.available() > 0) {
-    String input = Serial.readStringUntil('\n');
-    input.trim(); if (input.length() == 0) return;
-    char cmd = input.charAt(0);
+  static String input_buffer = "";
+  while (Serial.available() > 0) {
+    char in_char = Serial.read();
+    if (in_char == '\n' || in_char == '\r') {
+      String input = input_buffer;
+      input_buffer = "";
+      input.trim(); 
+      if (input.length() == 0) continue;
+      char cmd = input.charAt(0);
 
     if (cmd == 'h' || cmd == '?') { printHelpMenu(); return; }
 
@@ -675,23 +685,23 @@ void processUI() {
             case 'd': Serial.print("d "); Serial.print(my_addr); Serial.print(" "); Serial.println(background_lux); break;
             case 'p': Serial.print("p "); Serial.print(my_addr); Serial.print(" "); Serial.println(P_max * (current_u / 4095.0), 4); break;
             case 'E': {
-                mutex_enter_blocking(&data_mutex);
+                mutex_enter_blocking(&metrics_mutex);
                 float snap_E = E_energy;
-                mutex_exit(&data_mutex);
+                mutex_exit(&metrics_mutex);
                 Serial.print("E "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_E, 4); 
                 break;
             }
             case 'V': {
-                mutex_enter_blocking(&data_mutex);
+                mutex_enter_blocking(&metrics_mutex);
                 float snap_V = metrics_count > 0 ? (V_visibility_sum / metrics_count) : 0;
-                mutex_exit(&data_mutex);
+                mutex_exit(&metrics_mutex);
                 Serial.print("V "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_V, 4); 
                 break;
             }
             case 'F': {
-                mutex_enter_blocking(&data_mutex);
+                mutex_enter_blocking(&metrics_mutex);
                 float snap_F = metrics_count > 0 ? (F_flicker_sum / metrics_count) : 0;
-                mutex_exit(&data_mutex);
+                mutex_exit(&metrics_mutex);
                 Serial.print("F "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_F, 4); 
                 break;
             }
@@ -748,33 +758,31 @@ void processUI() {
           mutex_enter_blocking(&data_mutex);
           switch (cmd) {
             case 'r': setpoint = val; Serial.println("ack"); break;
-            case 'u': manual_pwm = val; feedback_enabled = false; Serial.println("ack"); break; // Retificação do valor para PWM (0-4095)
-            case 'f': feedback_enabled = (val > 0); if(!feedback_enabled) manual_pwm = current_u; Serial.println("ack"); break;
-            case 'a': anti_windup_enabled = (val > 0); Serial.println("ack"); break;
-            case 'o': 
-              current_occupancy = input.charAt(sS + 1); 
-              setpoint = (current_occupancy == 'h') ? lower_bound_high : (current_occupancy == 'l' ? lower_bound_low : 0.0);
-              Serial.println("ack"); break;
-            case 'U': lower_bound_low = val; Serial.println("ack"); break;
-            case 'O': lower_bound_high = val; Serial.println("ack"); break;
-            case 'C': energy_cost = val; Serial.println("ack"); break;
-            default: Serial.println("err"); break;
-          }
-          mutex_exit(&data_mutex);
-      } else {
-          if (cmd == 'o') val = (float)input.charAt(sS + 1); 
-          sendCANNetworkMsg('s', cmd, target_node, val);
-          Serial.println("ack");
-      }
+                    case 'u': manual_pwm = val; feedback_enabled = false; Serial.println("ack"); break;
+                    case 'f': feedback_enabled = (val > 0); if(!feedback_enabled) manual_pwm = current_u; Serial.println("ack"); break;
+                    case 'a': anti_windup_enabled = (val > 0); Serial.println("ack"); break;
+                    case 'o': current_occupancy = input.charAt(sS + 1); setpoint = (current_occupancy == 'h') ? lower_bound_high : (current_occupancy == 'l' ? lower_bound_low : 0.0); Serial.println("ack"); break;
+                    case 'U': lower_bound_low = val; Serial.println("ack"); break;
+                    case 'O': lower_bound_high = val; Serial.println("ack"); break;
+                    case 'C': energy_cost = val; Serial.println("ack"); break;
+                    default: Serial.println("err"); break;
+                  }
+                  mutex_exit(&data_mutex);
+              } else {
+                  if (cmd == 'o') val = (float)input.charAt(sS + 1);
+                  sendCANNetworkMsg('s', cmd, target_node, val);
+                  Serial.println("ack");
+              }
+        }
+    } else {
+        input_buffer += in_char;
     }
   }
 }
 
-// ======================================================================
-// --- SETUP & MAIN LOOP ---
-// ======================================================================
 void setup() {
     mutex_init(&data_mutex);
+    mutex_init(&metrics_mutex);
     Serial.begin(115200);
     SPI.begin();
     mcp2515 = new MCP2515(CAN_CS_PIN);
@@ -889,7 +897,7 @@ void loop1() {
     if (snap_fb) {
         float sum_lambda_k = 0.0;
         for (int j = 0; j < num_nodes; j++) {
-            sum_lambda_k += snap_lambda[j] * snap_gain[j][my_addr - 1];
+            sum_lambda_k += snap_lambda[j] * snap_gain[my_addr - 1][j];
         }
 
         float u_opt = sum_lambda_k / (2.0 * energy_cost);
@@ -900,7 +908,7 @@ void loop1() {
             if (j == my_addr - 1) {
                 y_est += snap_gain[my_addr - 1][my_addr - 1] * u;
             } else {
-                y_est += snap_gain[my_addr - 1][j] * snap_net_u[j];
+                y_est += snap_gain[j][my_addr - 1] * snap_net_u[j];
             }
         }
 

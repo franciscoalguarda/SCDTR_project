@@ -20,18 +20,20 @@ uint32_t my_uid = 0;
 int my_addr = 0;     
 bool is_hub = false; 
 
-const int MAX_NODES = 3;
+// Limite máximo de memória (Plug & Play dita o número real de nós)
+const int MAX_NODES = 10;
 int num_nodes = 0;
 uint32_t network_uids[MAX_NODES];
 
 float gain_matrix[MAX_NODES][MAX_NODES]; 
 float lux_off[MAX_NODES];                
 float network_lux[MAX_NODES];            
-float network_u[MAX_NODES] = {0.0, 0.0, 0.0}; 
+float network_u[MAX_NODES] = {0}; 
 
 unsigned long last_hello_ms = 0;
 const unsigned long HELLO_PERIOD_MS = 500;
 unsigned long boot_start_ms = 0;
+unsigned long last_discovery_ms = 0; // Cronómetro do Plug & Play
 
 int calib_led_node = 1;
 int calib_req_node = 1;
@@ -56,11 +58,11 @@ bool stream_active_u[MAX_NODES + 1] = {false};
 
 volatile bool distributed_ctrl = false; 
 float current_lambda = 0.0;             
-float network_lambda[MAX_NODES] = {0.0, 0.0, 0.0}; 
+float network_lambda[MAX_NODES] = {0}; 
 
 volatile float pd_rho = 0.0001;         
-volatile float pd_alpha = 0.005;        
-volatile float pd_decay = 0.001;        
+volatile float pd_alpha = 0.01;        
+volatile float pd_decay = 0.005;        
 
 // ======================================================================
 // --- LOCAL LUMINAIRE CONFIGURATION (PHASE 1) ---
@@ -85,7 +87,7 @@ char current_occupancy = 'h';
 float lower_bound_low = 10.0;  
 float lower_bound_high = 50.0; 
 volatile float setpoint = lower_bound_high;
-volatile float energy_cost = 25.0;       
+volatile float energy_cost = 1.0;       
 
 // Variável global para o Filtro IIR
 volatile float filtered_lux_val = -1.0;
@@ -147,12 +149,10 @@ PIDController myPID(80.0, 400.0, 0.0, 0.5);
 
 // Filtro Passa-Baixo Exponencial (IIR)
 float getFilteredLux(float new_sample) {
-    // Inicialização segura no arranque
     if (filtered_lux_val < 0.0) {
         filtered_lux_val = new_sample;
         return filtered_lux_val;
     }
-    // 5% de influência da nova leitura, 95% de inércia da memória
     filtered_lux_val = (0.05 * new_sample) + (0.95 * filtered_lux_val);
     return filtered_lux_val;
 }
@@ -198,6 +198,7 @@ bool register_node(uint32_t uid) {
     }
     if (num_nodes < MAX_NODES) {
         network_uids[num_nodes++] = uid;
+        last_discovery_ms = millis(); // Reinicia o cronómetro do Plug & Play
         return true;
     }
     return false;
@@ -220,7 +221,7 @@ void assign_addresses() {
     
     Serial.print("\n=== BOOT DONE ===\nMy UID: "); Serial.println(my_uid);
     Serial.print("Assigned Address: NODE "); Serial.println(my_addr);
-    Serial.print("Role: "); Serial.println(is_hub ? "HUB (Master)" : "SLAVE");
+    Serial.print("Role: "); Serial.println(is_hub ? "Leader (Calib)" : "Follower");
 }
 
 // ======================================================================
@@ -239,6 +240,7 @@ void sendCANNetworkMsg(char action, char variable, int dest_node, float value) {
   
   mcp2515->sendMessage(&canMsg);
 
+  // Loopback Local para que a placa também oiça os seus próprios Broadcasts
   if (dest_node == my_addr || dest_node == 0) {
       process_calib_and_network(canMsg);
   }
@@ -258,7 +260,7 @@ void sendCANUidMsg(int dest_node, uint32_t uid_val) {
 
 void send_hello() {
   struct can_frame canMsg;
-  canMsg.can_id  = 99; 
+  canMsg.can_id  = my_uid; // UID único evita colisões de arranques síncronos
   canMsg.can_dlc = 7;
   canMsg.data[0] = 'w'; 
   canMsg.data[1] = 'h'; 
@@ -278,19 +280,33 @@ void process_calib_and_network(struct can_frame &canMsg) {
     unsigned char* p = (unsigned char*)&value;
     for(int i = 0; i < 4; i++) p[i] = canMsg.data[3 + i];
 
+    // --- NOVO: RECETOR UNIVERSAL DE STREAM ---
+    // Se ouvir um stream de CAN-Bus, e eu sou a placa ligada ao USB, eu imprimo!
+    if (action == 's') {
+        Serial.print("s "); Serial.print(variable); Serial.print(" "); Serial.print(sender_id);
+        Serial.print(" "); Serial.print(value, 4);
+        Serial.print(" "); Serial.println(millis()); // Usa o relógio local da placa ligada ao PC para alinhar os gráficos
+        return;
+    }
+
     if (action == 'R') {
         Serial.println("\n[SYSTEM] Restart command received. Rebooting and recalibrating...");
         mutex_enter_blocking(&data_mutex);
         myPID.reset(); E_energy = 0; V_visibility_sum = 0; F_flicker_sum = 0; metrics_count = 0;
         distributed_ctrl = false; 
         current_lambda = 0.0;
-        filtered_lux_val = -1.0; // Reset ao Filtro IIR
-        for(int i=0; i<MAX_NODES; i++) last_rx_time[i] = 0; // Reset ao Watchdog
+        filtered_lux_val = -1.0; 
+        for(int i=0; i<MAX_NODES; i++) last_rx_time[i] = 0; 
         mutex_exit(&data_mutex);
-        background_lux = 0;
+        
+        // Reset Total Plug & Play
+        boot_state = BOOT_IDLE; 
+        calib_state = CALIB_IDLE;
         system_ready = false;
+        num_nodes = 0; 
+        is_hub = false;
+        background_lux = 0;
         for(int k = 0; k <= MAX_NODES; k++) { stream_active_y[k] = false; stream_active_u[k] = false; }
-        if (is_hub) calib_state = CALIB_START; 
         return;
     }
 
@@ -317,7 +333,7 @@ void process_calib_and_network(struct can_frame &canMsg) {
     if (action == 'l' && sender_id >= 1 && sender_id <= MAX_NODES) {
         mutex_enter_blocking(&data_mutex);
         network_lambda[sender_id - 1] = value;
-        last_rx_time[sender_id - 1] = millis(); // O Watchdog recebe sinal de vida
+        last_rx_time[sender_id - 1] = millis(); 
         mutex_exit(&data_mutex);
         return; 
     }
@@ -387,7 +403,7 @@ void process_calib_and_network(struct can_frame &canMsg) {
             feedback_enabled = true; 
             distributed_ctrl = false; 
             
-            filtered_lux_val = background_lux; // Inicializa filtro com fundo medido
+            filtered_lux_val = background_lux; 
             for(int k=0; k<MAX_NODES; k++) last_rx_time[k] = millis();
             
             mutex_exit(&data_mutex);
@@ -402,7 +418,7 @@ void process_calib_and_network(struct can_frame &canMsg) {
         if (variable == 'u') {
             mutex_enter_blocking(&data_mutex);
             network_u[sender_id - 1] = value;
-            last_rx_time[sender_id - 1] = millis(); // O Watchdog recebe sinal de vida
+            last_rx_time[sender_id - 1] = millis(); 
             mutex_exit(&data_mutex);
         }
     }
@@ -445,13 +461,13 @@ void process_calib_and_network(struct can_frame &canMsg) {
         }
         sendCANNetworkMsg('d', variable, sender_id, reply_val);
     }
-    else if (action == 'Y') {
+    else if (action == 'Y') { // Remote Stream Start Request
         if (dest_node == my_addr) {
             if (variable == 'y') stream_active_y[my_addr] = true;
             else if (variable == 'u') stream_active_u[my_addr] = true;
         }
     }
-    else if (action == 'Z') {
+    else if (action == 'Z') { // Remote Stream Stop Request
         if (dest_node == my_addr) {
             if (variable == 'y') stream_active_y[my_addr] = false;
             else if (variable == 'u') stream_active_u[my_addr] = false;
@@ -519,11 +535,12 @@ void boot_task() {
             else if (my_uid == 122) { m = -1.0; b = 6.75; } 
             else { m = -1.0; b = 6.75; }
 
+            last_discovery_ms = now; 
             register_node(my_uid);
             boot_state = BOOT_ANNOUNCE;
             send_hello();
             last_hello_ms = now;
-            Serial.println("Waiting for all nodes to join...");
+            Serial.println("Waiting for nodes to join (Plug & Play)...");
             break;
             
         case BOOT_ANNOUNCE:
@@ -531,7 +548,7 @@ void boot_task() {
                 send_hello(); 
                 last_hello_ms = now;
             }
-            if (num_nodes == MAX_NODES) {
+            if (now - last_discovery_ms >= 8000) {
                 send_hello(); 
                 boot_start_ms = now; 
                 boot_state = BOOT_WAIT_STABLE;
@@ -542,18 +559,11 @@ void boot_task() {
             if (now - boot_start_ms >= 500) {
                 assign_addresses(); 
                 
-                // --- NOVO: CUSTOS DE ENERGIA INICIAIS POR PLACA ---
-                if (my_addr == 1) {
-                    energy_cost = 1.0;  // Placa 1 tem energia barata
-                } 
-                else if (my_addr == 2) {
-                    energy_cost = 5.0;  // Placa 2 tem energia cara!
-                } 
-                else if (my_addr == 3) {
-                    energy_cost = 1.0;  // Placa 3 tem energia barata
+                energy_cost = 1.0; 
+                if (my_addr == 2) {
+                    energy_cost = 5.0;  
                 }
-                // --------------------------------------------------
-
+                
                 boot_state = BOOT_DONE;
                 if (is_hub) calib_state = CALIB_START; 
             }
@@ -757,6 +767,10 @@ void executeCommand(String input) {
     if ((cmd == 's' || cmd == 'S') && input.length() > 2 && (input.charAt(2) == 'y' || input.charAt(2) == 'u')) {
       char var = input.charAt(2);
       int target_node = input.substring(4).toInt();
+      
+      // Tradução do Stream Remoto
+      char can_action = (cmd == 's') ? 'Y' : 'Z';
+
       if (target_node == my_addr) {
         if (cmd == 's') {
             if (var == 'y') stream_active_y[my_addr] = true;
@@ -767,7 +781,8 @@ void executeCommand(String input) {
         }
         Serial.println("ack");
       } else {
-        sendCANNetworkMsg(cmd, var, target_node, 0.0); 
+        // Envia o pedido para o target remoto via CAN
+        sendCANNetworkMsg(can_action, var, target_node, 0.0); 
         Serial.println("ack");
       }
       return;
@@ -908,15 +923,13 @@ void loop() {
         history_idx = (history_idx + 1) % minute_buffer_size;
         hist_cnt++;
 
+        // --- NOVO: EMISSOR UNIVERSAL DE STREAM (BROADCAST PARA TODOS) ---
         if (stream_active_y[my_addr]) {
-          Serial.print("s y "); Serial.print(my_addr); 
-          Serial.print(" "); Serial.print(lux_snap, 4);
-          Serial.print(" "); Serial.println(millis());
+            // Envia para a rede toda (dest_node = 0). Quem estiver ligado ao USB imprime!
+            sendCANNetworkMsg('s', 'y', 0, lux_snap); 
         }
         if (stream_active_u[my_addr]) {
-          Serial.print("s u "); Serial.print(my_addr); 
-          Serial.print(" "); Serial.print(u_snap, 4);
-          Serial.print(" "); Serial.println(millis());
+            sendCANNetworkMsg('s', 'u', 0, u_snap);
         }
 
         if (hist_cnt >= 10) {

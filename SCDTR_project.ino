@@ -56,13 +56,13 @@ const unsigned long WATCHDOG_TIMEOUT_MS = 2000;
 bool stream_active_y[MAX_NODES + 1] = {false}; 
 bool stream_active_u[MAX_NODES + 1] = {false};
 
-volatile bool distributed_ctrl = false; 
+volatile bool distributed_ctrl = true; 
 float current_lambda = 0.0;             
 float network_lambda[MAX_NODES] = {0}; 
 
 volatile float pd_rho = 0.0001;         
-volatile float pd_alpha = 0.01;        
-volatile float pd_decay = 0.005;        
+volatile float pd_alpha = 0.005;        
+volatile float pd_decay = 0.001;        
 
 // ======================================================================
 // --- LOCAL LUMINAIRE CONFIGURATION (PHASE 1) ---
@@ -86,7 +86,12 @@ char current_occupancy = 'h';
 
 float lower_bound_low = 10.0;  
 float lower_bound_high = 50.0; 
-volatile float setpoint = lower_bound_high;
+
+// --- RAMPA DE REFERENCIA (Soft Start) ---
+volatile float current_setpoint = lower_bound_high; // O que a matemática vê (Muda devagar)
+volatile float target_setpoint = lower_bound_high;  // O objetivo final (Muda rápido pelo comando)
+// ----------------------------------------------
+
 volatile float energy_cost = 1.0;       
 
 // Variável global para o Filtro IIR
@@ -198,7 +203,7 @@ bool register_node(uint32_t uid) {
     }
     if (num_nodes < MAX_NODES) {
         network_uids[num_nodes++] = uid;
-        last_discovery_ms = millis(); // Reinicia o cronómetro do Plug & Play
+        last_discovery_ms = millis(); 
         return true;
     }
     return false;
@@ -221,7 +226,7 @@ void assign_addresses() {
     
     Serial.print("\n=== BOOT DONE ===\nMy UID: "); Serial.println(my_uid);
     Serial.print("Assigned Address: NODE "); Serial.println(my_addr);
-    Serial.print("Role: "); Serial.println(is_hub ? "Leader (Calib)" : "Follower");
+    Serial.print("Role: "); Serial.println(is_hub ? "Hub" : "Node");
 }
 
 // ======================================================================
@@ -240,7 +245,7 @@ void sendCANNetworkMsg(char action, char variable, int dest_node, float value) {
   
   mcp2515->sendMessage(&canMsg);
 
-  // Loopback Local para que a placa também oiça os seus próprios Broadcasts
+  // Loopback Local 
   if (dest_node == my_addr || dest_node == 0) {
       process_calib_and_network(canMsg);
   }
@@ -260,7 +265,7 @@ void sendCANUidMsg(int dest_node, uint32_t uid_val) {
 
 void send_hello() {
   struct can_frame canMsg;
-  canMsg.can_id  = my_uid; // UID único evita colisões de arranques síncronos
+  canMsg.can_id  = my_uid; 
   canMsg.can_dlc = 7;
   canMsg.data[0] = 'w'; 
   canMsg.data[1] = 'h'; 
@@ -280,12 +285,10 @@ void process_calib_and_network(struct can_frame &canMsg) {
     unsigned char* p = (unsigned char*)&value;
     for(int i = 0; i < 4; i++) p[i] = canMsg.data[3 + i];
 
-    // --- NOVO: RECETOR UNIVERSAL DE STREAM ---
-    // Se ouvir um stream de CAN-Bus, e eu sou a placa ligada ao USB, eu imprimo!
     if (action == 's') {
         Serial.print("s "); Serial.print(variable); Serial.print(" "); Serial.print(sender_id);
         Serial.print(" "); Serial.print(value, 4);
-        Serial.print(" "); Serial.println(millis()); // Usa o relógio local da placa ligada ao PC para alinhar os gráficos
+        Serial.print(" "); Serial.println(millis());
         return;
     }
 
@@ -299,14 +302,13 @@ void process_calib_and_network(struct can_frame &canMsg) {
         for(int i=0; i<MAX_NODES; i++) last_rx_time[i] = 0; 
         mutex_exit(&data_mutex);
         
-        // Reset Total Plug & Play
         boot_state = BOOT_IDLE; 
         calib_state = CALIB_IDLE;
         system_ready = false;
         num_nodes = 0; 
         is_hub = false;
         background_lux = 0;
-        for(int k = 0; k <= MAX_NODES; k++) { stream_active_y[k] = false; stream_active_u[k] = false; }
+        // Streams não são mortos aqui para podermos fazer o plot do arranque!
         return;
     }
 
@@ -314,7 +316,13 @@ void process_calib_and_network(struct can_frame &canMsg) {
         uint32_t received_uid;
         unsigned char* up = (unsigned char*)&received_uid;
         for(int i = 0; i < 4; i++) up[i] = canMsg.data[3 + i];
-        register_node(received_uid);
+        
+        register_node(received_uid); 
+        
+        if (system_ready && is_hub) {
+            Serial.println("\n[HUB] Reboot ou Novo no detetado! A forcar recalibracao global...");
+            sendCANNetworkMsg('R', 'R', 0, 0); 
+        }
         return;
     }
 
@@ -400,8 +408,17 @@ void process_calib_and_network(struct can_frame &canMsg) {
             
             system_ready = true;
             mutex_enter_blocking(&data_mutex);
-            feedback_enabled = true; 
-            distributed_ctrl = false; 
+            feedback_enabled = false; 
+            distributed_ctrl = true; 
+            current_lambda = 0.0;
+            
+            if (system_gain > 0.0001) {
+                current_u = (current_setpoint - background_lux) / system_gain;
+                if (current_u > 4095.0) current_u = 4095.0; 
+                if (current_u < 0.0) current_u = 0.0;       
+            } else {
+                current_u = 0.0;
+            }
             
             filtered_lux_val = background_lux; 
             for(int k=0; k<MAX_NODES; k++) last_rx_time[k] = millis();
@@ -434,7 +451,8 @@ void process_calib_and_network(struct can_frame &canMsg) {
         switch(variable) {
             case 'y': mutex_enter_blocking(&data_mutex); reply_val = current_lux; mutex_exit(&data_mutex); break;
             case 'u': mutex_enter_blocking(&data_mutex); reply_val = current_u; mutex_exit(&data_mutex); break;
-            case 'r': reply_val = setpoint; break;
+            case 'l': mutex_enter_blocking(&data_mutex); reply_val = current_lambda; mutex_exit(&data_mutex); break; 
+            case 'r': reply_val = target_setpoint; break; 
             case 'v': reply_val = (analogRead(A0) / 4095.0) * 3.3; break;
             case 'R': reply_val = get_R_LDR(); break; 
             case 't': reply_val = millis() / 1000.0; break;
@@ -461,21 +479,21 @@ void process_calib_and_network(struct can_frame &canMsg) {
         }
         sendCANNetworkMsg('d', variable, sender_id, reply_val);
     }
-    else if (action == 'Y') { // Remote Stream Start Request
+    else if (action == 'Y') { 
         if (dest_node == my_addr) {
             if (variable == 'y') stream_active_y[my_addr] = true;
             else if (variable == 'u') stream_active_u[my_addr] = true;
         }
     }
-    else if (action == 'Z') { // Remote Stream Stop Request
+    else if (action == 'Z') { 
         if (dest_node == my_addr) {
             if (variable == 'y') stream_active_y[my_addr] = false;
             else if (variable == 'u') stream_active_u[my_addr] = false;
         }
     }
-    else if (action == 'W') {
+    else if (action == 'W') { 
         mutex_enter_blocking(&data_mutex);
-        if (variable == 'r') setpoint = value;
+        if (variable == 'r') target_setpoint = value; 
         else if (variable == 'u') { manual_pwm = value; feedback_enabled = false; distributed_ctrl = false; }
         else if (variable == 'f') { feedback_enabled = (value > 0); if (feedback_enabled) distributed_ctrl = false; }
         else if (variable == 'a') anti_windup_enabled = (value > 0);
@@ -492,9 +510,9 @@ void process_calib_and_network(struct can_frame &canMsg) {
         else if (variable == 'w') pd_decay = value; 
         else if (variable == 'o') { 
             current_occupancy = (char)value; 
-            if (current_occupancy == 'h') setpoint = lower_bound_high;
-            else if (current_occupancy == 'l') setpoint = lower_bound_low;
-            else setpoint = 0.0;
+            if (current_occupancy == 'h') target_setpoint = lower_bound_high;
+            else if (current_occupancy == 'l') target_setpoint = lower_bound_low;
+            else target_setpoint = 0.0;
         }
         mutex_exit(&data_mutex);
     }
@@ -561,7 +579,7 @@ void boot_task() {
                 
                 energy_cost = 1.0; 
                 if (my_addr == 2) {
-                    energy_cost = 5.0;  
+                    energy_cost = 1.0;  
                 }
                 
                 boot_state = BOOT_DONE;
@@ -668,6 +686,7 @@ void printHelpMenu() {
   Serial.println("  g V <node>     : Get Mean Visibility Error");
   Serial.println("  g F <node>     : Get Mean Flicker Error");
   Serial.println("  g w <node>     : Get Weight Decay");
+  Serial.println("  g l <node>     : Get current Lambda (Panic Balloon)"); 
   Serial.println("  g o <node>     : Get Occupancy state");
   Serial.println("  g v <node>     : Get LDR Voltage");
   Serial.println("  g R <node>     : Get LDR Resistance (Ohms) [CALIBRATION]");
@@ -716,7 +735,8 @@ void executeCommand(String input) {
       if (target_node == my_addr) {
           switch (subcmd) {
             case 'u': { mutex_enter_blocking(&data_mutex); float snap_u = current_u; mutex_exit(&data_mutex); Serial.print("u "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_u); break;}
-            case 'r': Serial.print("r "); Serial.print(my_addr); Serial.print(" "); Serial.println(setpoint); break;
+            case 'r': Serial.print("r "); Serial.print(my_addr); Serial.print(" "); Serial.println(target_setpoint); break;
+            case 'l': { mutex_enter_blocking(&data_mutex); float snap_lam = current_lambda; mutex_exit(&data_mutex); Serial.print("l "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_lam, 4); break;} 
             case 'y': { mutex_enter_blocking(&data_mutex); float snap_y = current_lux; mutex_exit(&data_mutex); Serial.print("y "); Serial.print(my_addr); Serial.print(" "); Serial.println(snap_y); break;}
             case 'a': Serial.print("a "); Serial.print(my_addr); Serial.print(" "); Serial.println(anti_windup_enabled); break;
             case 'f': Serial.print("f "); Serial.print(my_addr); Serial.print(" "); Serial.println(feedback_enabled); break;
@@ -768,7 +788,6 @@ void executeCommand(String input) {
       char var = input.charAt(2);
       int target_node = input.substring(4).toInt();
       
-      // Tradução do Stream Remoto
       char can_action = (cmd == 's') ? 'Y' : 'Z';
 
       if (target_node == my_addr) {
@@ -781,7 +800,6 @@ void executeCommand(String input) {
         }
         Serial.println("ack");
       } else {
-        // Envia o pedido para o target remoto via CAN
         sendCANNetworkMsg(can_action, var, target_node, 0.0); 
         Serial.println("ack");
       }
@@ -804,35 +822,38 @@ void executeCommand(String input) {
       int target_node = input.substring(fS + 1, sS).toInt();
       float val = input.substring(sS + 1).toFloat();
 
-      if (target_node == my_addr) {
+      if (target_node == my_addr || target_node == 0) {
           mutex_enter_blocking(&data_mutex);
           switch (cmd) {
-            case 'r': setpoint = val; Serial.println("ack"); break;
-            case 'u': manual_pwm = val; feedback_enabled = false; distributed_ctrl = false; Serial.println("ack"); break;
-            case 'f': feedback_enabled = (val > 0); if(feedback_enabled) distributed_ctrl = false; Serial.println("ack"); break;
+            case 'r': target_setpoint = val; break; 
+            case 'u': manual_pwm = val; feedback_enabled = false; distributed_ctrl = false; break;
+            case 'f': feedback_enabled = (val > 0); if(feedback_enabled) distributed_ctrl = false; break;
             case 'D': 
                 distributed_ctrl = (val > 0); 
                 if (distributed_ctrl) feedback_enabled = false; 
                 current_lambda = 0.0; 
-                Serial.println("ack"); break;
-            case 'P': pd_rho = val; Serial.println("ack"); break;
-            case 'A': pd_alpha = val; Serial.println("ack"); break;
-            case 'w': pd_decay = val; Serial.println("ack"); break; 
-            case 'a': anti_windup_enabled = (val > 0); Serial.println("ack"); break;
+                break;
+            case 'P': pd_rho = val; break;
+            case 'A': pd_alpha = val; break;
+            case 'w': pd_decay = val; break; 
+            case 'a': anti_windup_enabled = (val > 0); break;
             case 'o': 
               current_occupancy = input.charAt(sS + 1); 
-              setpoint = (current_occupancy == 'h') ? lower_bound_high : (current_occupancy == 'l' ? lower_bound_low : 0.0);
-              Serial.println("ack"); break;
-            case 'U': lower_bound_low = val; Serial.println("ack"); break;
-            case 'O': lower_bound_high = val; Serial.println("ack"); break;
-            case 'C': energy_cost = val; Serial.println("ack"); break;
-            default: Serial.println("err"); break;
+              target_setpoint = (current_occupancy == 'h') ? lower_bound_high : (current_occupancy == 'l' ? lower_bound_low : 0.0); 
+              break;
+            case 'U': lower_bound_low = val; break;
+            case 'O': lower_bound_high = val; break;
+            case 'C': energy_cost = val; break;
+            default: break;
           }
           mutex_exit(&data_mutex);
-      } else {
+          if (target_node == my_addr) Serial.println("ack");
+      } 
+      
+      if (target_node != my_addr) {
           if (cmd == 'o') val = (float)input.charAt(sS + 1); 
           sendCANNetworkMsg('W', cmd, target_node, val);
-          Serial.println("ack");
+          if (target_node != 0) Serial.println("ack");
       }
     }
 }
@@ -923,9 +944,7 @@ void loop() {
         history_idx = (history_idx + 1) % minute_buffer_size;
         hist_cnt++;
 
-        // --- NOVO: EMISSOR UNIVERSAL DE STREAM (BROADCAST PARA TODOS) ---
         if (stream_active_y[my_addr]) {
-            // Envia para a rede toda (dest_node = 0). Quem estiver ligado ao USB imprime!
             sendCANNetworkMsg('s', 'y', 0, lux_snap); 
         }
         if (stream_active_u[my_addr]) {
@@ -957,13 +976,23 @@ void loop1() {
     if (now - last_t < 10) return;  
     last_t += 10;
 
+    // --- RAMPA DE REFERENCIA (SOFT START) ---
+    float ramp_speed = 0.04; 
+    if (current_setpoint < target_setpoint) {
+        current_setpoint += ramp_speed;
+        if (current_setpoint > target_setpoint) current_setpoint = target_setpoint;
+    } else if (current_setpoint > target_setpoint) {
+        current_setpoint -= ramp_speed;
+        if (current_setpoint < target_setpoint) current_setpoint = target_setpoint;
+    }
+
     float lux = getFilteredLux(getLux());
 
     mutex_enter_blocking(&data_mutex);
     bool snap_fb = feedback_enabled;
     bool snap_dist = distributed_ctrl; 
     bool snap_aw = anti_windup_enabled;
-    float snap_sp = setpoint;
+    float snap_sp = current_setpoint; 
     float snap_man = manual_pwm;
     float snap_cost = energy_cost;
     float snap_rho = pd_rho;
@@ -972,9 +1001,7 @@ void loop1() {
     float snap_net_u[MAX_NODES];
     float snap_net_lam[MAX_NODES];
     
-    // Verificação de Watchdog na rede
     for (int i = 0; i < num_nodes; i++) {
-        // Se a placa não é a própria e não deu sinal de vida nos últimos 2000ms
         if (i != (my_addr - 1) && (now - last_rx_time[i] > WATCHDOG_TIMEOUT_MS)) {
             snap_net_u[i] = 0.0;
             snap_net_lam[i] = 0.0;
@@ -987,40 +1014,44 @@ void loop1() {
 
     float u_out = 0;
 
-    // --- ALGORITMO DE OTIMIZAÇÃO: PRIMAL-DUAL COM WEIGHT DECAY ---
     if (snap_dist) {
-        // 1. UPDATE DUAL (Atualiza o Lambda local com Regularização)
-        float L_i = snap_sp; 
-        
-        current_lambda = current_lambda * (1.0 - snap_decay); 
-        current_lambda += snap_alpha * (L_i - lux);
-        
-        // --- A MAGIA DO ANTI-WINDUP DUAL ---
-        if (current_lambda < 0) current_lambda = 0; 
-        
-        // Teto máximo para o Lambda. Impede acumulação letal de erro!
-        float max_lambda = 1000.0; 
-        if (current_lambda > max_lambda) current_lambda = max_lambda; 
-
-        // 2. UPDATE PRIMAL (Atualiza o Duty Cycle)
+        // 1. AVALIAÇÃO DE REDE (GRADIENTE) PRIMEIRO
+        // Precisamos calcular o gradiente antes do travão, para saber o que a rede quer!
         float grad_d = snap_cost; 
-        
         for (int j = 0; j < num_nodes; j++) {
-            // O ganho do MEU LED na mesa do VIZINHO (J)
             float G_ji = gain_matrix[my_addr - 1][j] * 4095.0; 
             float lam_j = (j == (my_addr - 1)) ? current_lambda : snap_net_lam[j];
             grad_d -= lam_j * G_ji; 
         }
 
+        // --- TRAVÃO INTELIGENTE (Network-Aware) ---
+        float active_decay = snap_decay;
+        float active_rho = snap_rho;
+
+        if (lux > snap_sp + 2.0) { 
+            // Fura sempre o balão para matar o overshoot local
+            active_decay = 0.2;            
+            
+            // SÓ trava o PWM violentamente SE a rede não precisar de luz (grad_d > 0)
+            if (grad_d > 0.0) {
+                active_rho = snap_rho * 10.0;  
+            }
+        }
+        
+        // 2. UPDATE DUAL
+        current_lambda = current_lambda * (1.0 - active_decay) + snap_alpha * (snap_sp - lux);
+        if (current_lambda < 0) current_lambda = 0; 
+        if (current_lambda > 500.0) current_lambda = 500.0; 
+
+        // 3. UPDATE PRIMAL
         float d_i = current_u / 4095.0; 
-        d_i -= snap_rho * grad_d;
+        d_i -= active_rho * grad_d;
         
         if (d_i < 0) d_i = 0;
         if (d_i > 1) d_i = 1;
 
         u_out = d_i * 4095.0; 
-    } 
-    // --- CONTROLADOR CEGO: PID LOCAL ---
+    }
     else if (snap_fb) {
         float instant_external_illuminance = 0.0;
         static float filtered_external_illuminance = 0.0; 
@@ -1040,7 +1071,6 @@ void loop1() {
 
         u_out = myPID.compute(snap_sp, lux, snap_aw, ff_pwm);
     } 
-    // --- MANUAL PWM ---
     else {
         u_out = snap_man;
     }

@@ -20,7 +20,6 @@ uint32_t my_uid = 0;
 int my_addr = 0;     
 bool is_hub = false; 
 
-// Limite máximo de memória (Plug & Play dita o número real de nós)
 const int MAX_NODES = 10;
 int num_nodes = 0;
 uint32_t network_uids[MAX_NODES];
@@ -33,7 +32,7 @@ float network_u[MAX_NODES] = {0};
 unsigned long last_hello_ms = 0;
 const unsigned long HELLO_PERIOD_MS = 500;
 unsigned long boot_start_ms = 0;
-unsigned long last_discovery_ms = 0; // Cronómetro do Plug & Play
+unsigned long last_discovery_ms = 0; 
 
 int calib_led_node = 1;
 int calib_req_node = 1;
@@ -45,16 +44,23 @@ int send_mat_row = 0;
 int send_mat_col = 0;
 
 mutex_t data_mutex;
-
-// Watchdog de Falhas de Rede
 unsigned long last_rx_time[MAX_NODES] = {0}; 
 const unsigned long WATCHDOG_TIMEOUT_MS = 2000;
+
+// Network and Execution Diagnostics Variables
+unsigned long ping_start_time = 0;
+volatile unsigned long core1_max_dt = 0;
+volatile unsigned long core1_min_dt = 9999999;
 
 // ======================================================================
 // --- STREAMING & CONTROL STATE ---
 // ======================================================================
 bool stream_active_y[MAX_NODES + 1] = {false}; 
 bool stream_active_u[MAX_NODES + 1] = {false};
+
+// Global buffers for Excel aggregator
+float stream_val_y[MAX_NODES] = {0};
+float stream_val_u[MAX_NODES] = {0};
 
 volatile bool distributed_ctrl = true; 
 float current_lambda = 0.0;             
@@ -87,14 +93,11 @@ char current_occupancy = 'h';
 float lower_bound_low = 10.0;  
 float lower_bound_high = 50.0; 
 
-// --- RAMPA DE REFERENCIA (Soft Start) ---
-volatile float current_setpoint = lower_bound_high; // O que a matemática vê (Muda devagar)
-volatile float target_setpoint = lower_bound_high;  // O objetivo final (Muda rápido pelo comando)
-// ----------------------------------------------
+// --- REFERENCE RAMP (Soft Start) ---
+volatile float current_setpoint = lower_bound_high; 
+volatile float target_setpoint = lower_bound_high;  
 
 volatile float energy_cost = 1.0;       
-
-// Variável global para o Filtro IIR
 volatile float filtered_lux_val = -1.0;
 
 const int minute_buffer_size = 600; 
@@ -109,6 +112,7 @@ long metrics_count = 0;
 float last_u_1 = 0, last_u_2 = 0;          
 float P_max = 0.05;          
 
+// Prototypes
 void printHelpMenu();
 float getFilteredLux(float new_sample);
 float get_R_LDR(); 
@@ -116,29 +120,30 @@ float getLux();
 void updateMetrics(float u, float y, float ref);
 void process_calib_and_network(struct can_frame &canMsg);
 void executeCommand(String input); 
+void readCANMessages(); 
 
 // ======================================================================
 // --- PID CONTROLLER CLASS ---
 // ======================================================================
 class PIDController {
   private: 
-    float Kp, Ki, Kd, b_weight, i_term, last_error, h;
+    float Kp, Ki, Kd, b_weight, i_term, last_error, h_val;
   public:
     PIDController(float p, float i, float d, float bw) {
-      Kp = p; Ki = i; Kd = d; b_weight = bw; i_term = 0; last_error = 0; h = ::h; 
+      Kp = p; Ki = i; Kd = d; b_weight = bw; i_term = 0; last_error = 0; h_val = ::h; 
     }
     float compute(float ref, float y, bool antiwindup_control, float ff_pwm = 0.0) {
       float error_p = b_weight * ref - y; 
       float error = ref - y; 
       float p_term = Kp * error_p;
-      i_term += Ki * error * h; 
-      float d_term = Kd * (error - last_error) / h;
+      i_term += Ki * error * h_val; 
+      float d_term = Kd * (error - last_error) / h_val;
       last_error = error;
       
       float u = p_term + i_term + d_term + ff_pwm; 
       
-      if (u > 4095) { u = 4095; if (antiwindup_control && error > 0) i_term -= Ki * error * h; } 
-      else if (u < 0) { u = 0; if (antiwindup_control && error < 0) i_term -= Ki * error * h; }
+      if (u > 4095) { u = 4095; if (antiwindup_control && error > 0) i_term -= Ki * error * h_val; } 
+      else if (u < 0) { u = 0; if (antiwindup_control && error < 0) i_term -= Ki * error * h_val; }
       return u;
     }
     void setKp(float p) { Kp = p; }
@@ -151,8 +156,6 @@ PIDController myPID(80.0, 400.0, 0.0, 0.5);
 // ======================================================================
 // --- SENSOR READING & METRICS ---
 // ======================================================================
-
-// Filtro Passa-Baixo Exponencial (IIR)
 float getFilteredLux(float new_sample) {
     if (filtered_lux_val < 0.0) {
         filtered_lux_val = new_sample;
@@ -245,7 +248,6 @@ void sendCANNetworkMsg(char action, char variable, int dest_node, float value) {
   
   mcp2515->sendMessage(&canMsg);
 
-  // Loopback Local 
   if (dest_node == my_addr || dest_node == 0) {
       process_calib_and_network(canMsg);
   }
@@ -285,10 +287,21 @@ void process_calib_and_network(struct can_frame &canMsg) {
     unsigned char* p = (unsigned char*)&value;
     for(int i = 0; i < 4; i++) p[i] = canMsg.data[3 + i];
 
+    // --- STREAM AGGREGATOR ---
     if (action == 's') {
-        Serial.print("s "); Serial.print(variable); Serial.print(" "); Serial.print(sender_id);
-        Serial.print(" "); Serial.print(value, 4);
-        Serial.print(" "); Serial.println(millis());
+        if (variable == 'y') {
+            stream_val_y[sender_id - 1] = value;
+            // Only print individual line if global stream is NOT active
+            if (!stream_active_y[0]) {
+                Serial.print("s y "); Serial.print(sender_id); Serial.print(" "); Serial.print(value, 4); Serial.print(" "); Serial.println(millis());
+            }
+        } else if (variable == 'u') {
+            stream_val_u[sender_id - 1] = value;
+            // Only print individual line if global stream is NOT active
+            if (!stream_active_u[0]) {
+                Serial.print("s u "); Serial.print(sender_id); Serial.print(" "); Serial.print(value, 4); Serial.print(" "); Serial.println(millis());
+            }
+        }
         return;
     }
 
@@ -308,7 +321,6 @@ void process_calib_and_network(struct can_frame &canMsg) {
         num_nodes = 0; 
         is_hub = false;
         background_lux = 0;
-        // Streams não são mortos aqui para podermos fazer o plot do arranque!
         return;
     }
 
@@ -320,7 +332,7 @@ void process_calib_and_network(struct can_frame &canMsg) {
         register_node(received_uid); 
         
         if (system_ready && is_hub) {
-            Serial.println("\n[HUB] Reboot ou Novo no detetado! A forcar recalibracao global...");
+            Serial.println("\n[HUB] Reboot or New node detected! Forcing global recalibration...");
             sendCANNetworkMsg('R', 'R', 0, 0); 
         }
         return;
@@ -429,9 +441,7 @@ void process_calib_and_network(struct can_frame &canMsg) {
     }
 
     if (sender_id >= 1 && sender_id <= MAX_NODES) {
-        if (variable == 'y') {
-            network_lux[sender_id - 1] = value;
-        }
+        if (variable == 'y') { network_lux[sender_id - 1] = value; }
         if (variable == 'u') {
             mutex_enter_blocking(&data_mutex);
             network_u[sender_id - 1] = value;
@@ -476,17 +486,20 @@ void process_calib_and_network(struct can_frame &canMsg) {
                 else if (current_occupancy == 'l') reply_val = lower_bound_low;
                 else reply_val = 0.0;
                 break;
+            case 'j': reply_val = (float)(core1_max_dt - core1_min_dt); break; 
         }
         sendCANNetworkMsg('d', variable, sender_id, reply_val);
     }
+    
+    // --- MANAGEMENT OF Y AND Z COMMANDS WITH GLOBAL SUPPORT (dest_node == 0) ---
     else if (action == 'Y') { 
-        if (dest_node == my_addr) {
+        if (dest_node == my_addr || dest_node == 0) {
             if (variable == 'y') stream_active_y[my_addr] = true;
             else if (variable == 'u') stream_active_u[my_addr] = true;
         }
     }
     else if (action == 'Z') { 
-        if (dest_node == my_addr) {
+        if (dest_node == my_addr || dest_node == 0) {
             if (variable == 'y') stream_active_y[my_addr] = false;
             else if (variable == 'u') stream_active_u[my_addr] = false;
         }
@@ -531,6 +544,19 @@ void process_calib_and_network(struct can_frame &canMsg) {
         Serial.print(variable); Serial.print(" "); Serial.print(sender_id); Serial.print(" "); 
         if (variable == 'o') Serial.println((char)value);
         else Serial.println(value, 4);
+    }
+    
+    // --- RTT / PING LOGIC ---
+    if (action == 'T') {
+        sendCANNetworkMsg('A', '0', sender_id, 0.0);
+        return;
+    }
+    if (action == 'A') {
+        unsigned long rtt = micros() - ping_start_time;
+        Serial.print("RTT to Node "); Serial.print(sender_id); 
+        Serial.print(": "); Serial.print(rtt); Serial.println(" us");
+        Serial.print("Latency (1-way): "); Serial.print(rtt / 2.0); Serial.println(" us");
+        return;
     }
 }
 
@@ -578,9 +604,7 @@ void boot_task() {
                 assign_addresses(); 
                 
                 energy_cost = 1.0; 
-                if (my_addr == 2) {
-                    energy_cost = 1.0;  
-                }
+                if (my_addr == 2) { energy_cost = 1.0; }
                 
                 boot_state = BOOT_DONE;
                 if (is_hub) calib_state = CALIB_START; 
@@ -640,10 +664,7 @@ void calib_task() {
                 else if (send_mat_row < num_nodes) {
                     sendCANNetworkMsg('M', '0' + send_mat_row, send_mat_col + 1, gain_matrix[send_mat_row][send_mat_col]);
                     send_mat_col++;
-                    if (send_mat_col >= num_nodes) {
-                        send_mat_col = 0;
-                        send_mat_row++;
-                    }
+                    if (send_mat_col >= num_nodes) { send_mat_col = 0; send_mat_row++; }
                 } 
                 else {
                     sendCANNetworkMsg('c', 'd', 0, 0); 
@@ -693,12 +714,14 @@ void printHelpMenu() {
   Serial.println("  g d <node>     : Get External Illuminance");
   Serial.println("  g L <node>     : Get Current Lower Bound");
   Serial.println("  g id <node>    : Get UID and Address of node"); 
+  Serial.println("  g j <node>     : Get Core 1 Execution Jitter (us)");
   Serial.println("\n--- STREAM COMMANDS ---");                      
-  Serial.println("  s y <node>     : Start streaming LUX of node");   
-  Serial.println("  s u <node>     : Start streaming PWM of node");   
-  Serial.println("  S y <node>     : Stop streaming LUX of node");    
-  Serial.println("  S u <node>     : Stop streaming PWM of node");    
-  Serial.println("\n--- LOCAL COMMANDS ---");
+  Serial.println("  s y <node>     : Start streaming LUX (Use 0 for ALL)");   
+  Serial.println("  s u <node>     : Start streaming PWM (Use 0 for ALL)");   
+  Serial.println("  S y <node>     : Stop streaming LUX (Use 0 for ALL)");    
+  Serial.println("  S u <node>     : Stop streaming PWM (Use 0 for ALL)");    
+  Serial.println("\n--- SYSTEM & DIAGNOSTICS ---");
+  Serial.println("  T <node>       : Test RTT/Latency (Ping) to node");
   Serial.println("  p <val>        : Set Kp (Local)");
   Serial.println("  i <val>        : Set Ki (Local)");
   Serial.println("  d <val>        : Set Kd (Local)");
@@ -715,6 +738,17 @@ void executeCommand(String input) {
     if (cmd == 'R') { 
       sendCANNetworkMsg('R', 'R', 0, 0); 
       Serial.println("ack"); return;
+    }
+
+    if (cmd == 'T') {
+      int target_node = input.substring(2).toInt();
+      if(target_node == my_addr) {
+          Serial.println("RTT to the Hub itself is 0 us");
+          return;
+      }
+      ping_start_time = micros();
+      sendCANNetworkMsg('T', '0', target_node, 0.0);
+      return;
     }
 
     if (cmd == 'g') {
@@ -760,6 +794,7 @@ void executeCommand(String input) {
                 float L_val = 0;
                 if (current_occupancy == 'h') L_val = lower_bound_high;
                 else if (current_occupancy == 'l') L_val = lower_bound_low;
+                else L_val = 0.0;
                 Serial.print("L "); Serial.print(my_addr); Serial.print(" "); Serial.println(L_val); 
                 break;
             }
@@ -775,6 +810,13 @@ void executeCommand(String input) {
                 Serial.println();
                 break;
             }
+            case 'j': {
+                Serial.print("j "); Serial.print(my_addr); Serial.print(" "); Serial.println(core1_max_dt - core1_min_dt);
+                // Reset after reading to measure upcoming new cycles
+                core1_max_dt = 0;
+                core1_min_dt = 9999999;
+                break;
+            }
             default: Serial.println("err"); break;
           }
       } else {
@@ -787,22 +829,25 @@ void executeCommand(String input) {
     if ((cmd == 's' || cmd == 'S') && input.length() > 2 && (input.charAt(2) == 'y' || input.charAt(2) == 'u')) {
       char var = input.charAt(2);
       int target_node = input.substring(4).toInt();
-      
       char can_action = (cmd == 's') ? 'Y' : 'Z';
 
-      if (target_node == my_addr) {
+      if (target_node == my_addr || target_node == 0) {
         if (cmd == 's') {
-            if (var == 'y') stream_active_y[my_addr] = true;
-            else            stream_active_u[my_addr] = true;
+            if (var == 'y') { stream_active_y[my_addr] = true; if (target_node == 0) stream_active_y[0] = true; }
+            else            { stream_active_u[my_addr] = true; if (target_node == 0) stream_active_u[0] = true; }
         } else {
-            if (var == 'y') stream_active_y[my_addr] = false;
-            else            stream_active_u[my_addr] = false;
+            if (var == 'y') { stream_active_y[my_addr] = false; if (target_node == 0) stream_active_y[0] = false; }
+            else            { stream_active_u[my_addr] = false; if (target_node == 0) stream_active_u[0] = false; }
         }
-        Serial.println("ack");
-      } else {
+        if (target_node == my_addr) Serial.println("ack");
+      } 
+      
+      if (target_node != my_addr) {
         sendCANNetworkMsg(can_action, var, target_node, 0.0); 
-        Serial.println("ack");
+        if (target_node != 0) Serial.println("ack");
       }
+      
+      if (target_node == 0) Serial.println(cmd == 's' ? "Global Stream ON" : "Global Stream OFF");
       return;
     }
 
@@ -956,6 +1001,26 @@ void loop() {
           sendCANNetworkMsg('b', 'y', 0, lux_snap);
           sendCANNetworkMsg('b', 'u', 0, u_snap); 
         }
+
+        if (stream_active_y[0]) {
+            Serial.print("Y_ALL\t"); 
+            Serial.print(millis());
+            for(int i = 0; i < num_nodes; i++) {
+                Serial.print("\t"); 
+                Serial.print(stream_val_y[i], 4);
+            }
+            Serial.println();
+        }
+
+        if (stream_active_u[0]) {
+            Serial.print("U_ALL\t"); 
+            Serial.print(millis());
+            for(int i = 0; i < num_nodes; i++) {
+                Serial.print("\t"); 
+                Serial.print(stream_val_u[i], 4);
+            }
+            Serial.println();
+        }
       }
   }
 }
@@ -971,12 +1036,26 @@ void setup1() {
 void loop1() {
     if (!system_ready) return;
 
+    // 1. The 10 millisecond gate
     static unsigned long last_t = 0;
     unsigned long now = millis();
     if (now - last_t < 10) return;  
     last_t += 10;
 
-    // --- RAMPA DE REFERENCIA (SOFT START) ---
+    // 2. --- CORRECTED ACTUATION JITTER CALCULATION (CORE 1) ---
+    static unsigned long last_exec_micros = 0;
+    unsigned long now_micros = micros();
+    
+    // Only count if the last cycle was less than 20ms ago. 
+    // This prevents the long seconds of calibration from counting as "jitter"!
+    if (last_exec_micros > 0 && (now_micros - last_exec_micros < 20000)) {
+        unsigned long dt = now_micros - last_exec_micros;
+        if (dt > core1_max_dt) core1_max_dt = dt;
+        if (dt < core1_min_dt) core1_min_dt = dt;
+    }
+    last_exec_micros = now_micros;
+    // ----------------------------------------------------------
+
     float ramp_speed = 0.04; 
     if (current_setpoint < target_setpoint) {
         current_setpoint += ramp_speed;
@@ -1015,8 +1094,6 @@ void loop1() {
     float u_out = 0;
 
     if (snap_dist) {
-        // 1. AVALIAÇÃO DE REDE (GRADIENTE) PRIMEIRO
-        // Precisamos calcular o gradiente antes do travão, para saber o que a rede quer!
         float grad_d = snap_cost; 
         for (int j = 0; j < num_nodes; j++) {
             float G_ji = gain_matrix[my_addr - 1][j] * 4095.0; 
@@ -1024,26 +1101,20 @@ void loop1() {
             grad_d -= lam_j * G_ji; 
         }
 
-        // --- TRAVÃO INTELIGENTE (Network-Aware) ---
         float active_decay = snap_decay;
         float active_rho = snap_rho;
 
-        if (lux > snap_sp + 2.0) { 
-            // Fura sempre o balão para matar o overshoot local
+        if (lux > snap_sp + 0.5) { 
             active_decay = 0.2;            
-            
-            // SÓ trava o PWM violentamente SE a rede não precisar de luz (grad_d > 0)
             if (grad_d > 0.0) {
-                active_rho = snap_rho * 10.0;  
+                active_rho = snap_rho * 5.0;  
             }
         }
         
-        // 2. UPDATE DUAL
         current_lambda = current_lambda * (1.0 - active_decay) + snap_alpha * (snap_sp - lux);
         if (current_lambda < 0) current_lambda = 0; 
         if (current_lambda > 500.0) current_lambda = 500.0; 
 
-        // 3. UPDATE PRIMAL
         float d_i = current_u / 4095.0; 
         d_i -= active_rho * grad_d;
         
@@ -1051,7 +1122,7 @@ void loop1() {
         if (d_i > 1) d_i = 1;
 
         u_out = d_i * 4095.0; 
-    }
+    } 
     else if (snap_fb) {
         float instant_external_illuminance = 0.0;
         static float filtered_external_illuminance = 0.0; 

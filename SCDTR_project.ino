@@ -55,10 +55,11 @@ volatile unsigned long core1_min_dt = 9999999;
 // ======================================================================
 // --- STREAMING & CONTROL STATE ---
 // ======================================================================
+bool stream_active_both = false;           
 bool stream_active_y[MAX_NODES + 1] = {false}; 
 bool stream_active_u[MAX_NODES + 1] = {false};
 
-// Global buffers for Excel aggregator
+// Buffers globais para o agregador do Hub (Excel)
 float stream_val_y[MAX_NODES] = {0};
 float stream_val_u[MAX_NODES] = {0};
 
@@ -151,7 +152,7 @@ class PIDController {
     void setKd(float d) { Kd = d; }
     void reset() { i_term = 0; last_error = 0; }
 };
-PIDController myPID(80.0, 400.0, 0.0, 0.5); 
+PIDController myPID(80.0, 400.0, 0.0, 0.5); // Instancia global (podem ajustar os valores)
 
 // ======================================================================
 // --- SENSOR READING & METRICS ---
@@ -291,14 +292,12 @@ void process_calib_and_network(struct can_frame &canMsg) {
     if (action == 's') {
         if (variable == 'y') {
             stream_val_y[sender_id - 1] = value;
-            // Only print individual line if global stream is NOT active
-            if (!stream_active_y[0]) {
+            if (!stream_active_both && is_hub && stream_active_y[0]) { // Legacy print se nao for both
                 Serial.print("s y "); Serial.print(sender_id); Serial.print(" "); Serial.print(value, 4); Serial.print(" "); Serial.println(millis());
             }
         } else if (variable == 'u') {
             stream_val_u[sender_id - 1] = value;
-            // Only print individual line if global stream is NOT active
-            if (!stream_active_u[0]) {
+            if (!stream_active_both && is_hub && stream_active_u[0]) {
                 Serial.print("s u "); Serial.print(sender_id); Serial.print(" "); Serial.print(value, 4); Serial.print(" "); Serial.println(millis());
             }
         }
@@ -407,16 +406,18 @@ void process_calib_and_network(struct can_frame &canMsg) {
             system_gain = gain_matrix[my_addr - 1][my_addr - 1];
             background_lux = lux_off[my_addr - 1];
             
-            Serial.println("\n=== CALIBRATION MATRIX (K) ===");
-            for(int i=0; i<num_nodes; i++) {
-                for(int j=0; j<num_nodes; j++) {
-                    Serial.print("K"); Serial.print(i+1); Serial.print(j+1); Serial.print(": ");
-                    Serial.print(gain_matrix[i][j], 6); Serial.print("\t");
+            if(is_hub){
+                Serial.println("\n=== CALIBRATION MATRIX (K) ===");
+                for(int i=0; i<num_nodes; i++) {
+                    for(int j=0; j<num_nodes; j++) {
+                        Serial.print("K"); Serial.print(i+1); Serial.print(j+1); Serial.print(": ");
+                        Serial.print(gain_matrix[i][j], 6); Serial.print("\t");
+                    }
+                    Serial.println();
                 }
-                Serial.println();
+                Serial.println("==============================");
+                printHelpMenu();
             }
-            Serial.println("==============================");
-            printHelpMenu();
             
             system_ready = true;
             mutex_enter_blocking(&data_mutex);
@@ -574,6 +575,7 @@ void boot_task() {
         case BOOT_IDLE:
             my_uid = get_unique_id();
             
+            // Coloquem os vossos valores de calibração m e b aqui
             if (my_uid == 97) { m = -1.0; b = 6.75; } 
             else if (my_uid == 107) { m = -1.0; b = 6.75; } 
             else if (my_uid == 122) { m = -1.0; b = 6.75; } 
@@ -604,7 +606,6 @@ void boot_task() {
                 assign_addresses(); 
                 
                 energy_cost = 1.0; 
-                if (my_addr == 2) { energy_cost = 1.0; }
                 
                 boot_state = BOOT_DONE;
                 if (is_hub) calib_state = CALIB_START; 
@@ -718,8 +719,10 @@ void printHelpMenu() {
   Serial.println("\n--- STREAM COMMANDS ---");                      
   Serial.println("  s y <node>     : Start streaming LUX (Use 0 for ALL)");   
   Serial.println("  s u <node>     : Start streaming PWM (Use 0 for ALL)");   
+  Serial.println("  s b 0          : Start combined stream (LUX + PWM for ALL)");
   Serial.println("  S y <node>     : Stop streaming LUX (Use 0 for ALL)");    
   Serial.println("  S u <node>     : Stop streaming PWM (Use 0 for ALL)");    
+  Serial.println("  S b 0          : Stop combined stream");
   Serial.println("\n--- SYSTEM & DIAGNOSTICS ---");
   Serial.println("  T <node>       : Test RTT/Latency (Ping) to node");
   Serial.println("  p <val>        : Set Kp (Local)");
@@ -812,7 +815,6 @@ void executeCommand(String input) {
             }
             case 'j': {
                 Serial.print("j "); Serial.print(my_addr); Serial.print(" "); Serial.println(core1_max_dt - core1_min_dt);
-                // Reset after reading to measure upcoming new cycles
                 core1_max_dt = 0;
                 core1_min_dt = 9999999;
                 break;
@@ -826,11 +828,31 @@ void executeCommand(String input) {
       return;
     }
 
-    if ((cmd == 's' || cmd == 'S') && input.length() > 2 && (input.charAt(2) == 'y' || input.charAt(2) == 'u')) {
+    if ((cmd == 's' || cmd == 'S') && input.length() > 2 && (input.charAt(2) == 'y' || input.charAt(2) == 'u' || input.charAt(2) == 'b')) {
       char var = input.charAt(2);
       int target_node = input.substring(4).toInt();
       char can_action = (cmd == 's') ? 'Y' : 'Z';
 
+      // --- LOGICA PARA O STREAM COMBINADO ('b') ---
+      if (var == 'b') {
+          stream_active_both = (cmd == 's');
+          if (target_node == 0 || target_node == my_addr) {
+              stream_active_y[my_addr] = stream_active_both;
+              stream_active_u[my_addr] = stream_active_both;
+              stream_active_y[0] = stream_active_both;
+              stream_active_u[0] = stream_active_both;
+          }
+          if (target_node != my_addr) {
+              sendCANNetworkMsg(can_action, 'y', target_node, 0.0); 
+              delay(15); // [FIX] Evita colisao no barramento CAN ao enviar dois comandos seguidos
+              sendCANNetworkMsg(can_action, 'u', target_node, 0.0); 
+          }
+          if (target_node == 0) Serial.println(cmd == 's' ? "Combined Stream ON (LUX + PWM)" : "Combined Stream OFF");
+          else if (target_node == my_addr) Serial.println("ack");
+          return;
+      }
+
+      // --- LOGICA NORMAL PARA 'y' e 'u' ---
       if (target_node == my_addr || target_node == 0) {
         if (cmd == 's') {
             if (var == 'y') { stream_active_y[my_addr] = true; if (target_node == 0) stream_active_y[0] = true; }
@@ -980,6 +1002,10 @@ void loop() {
         bool dist_snap = distributed_ctrl;
         mutex_exit(&data_mutex);
 
+        // [FIX] O Hub regista os seus próprios dados no array global para aparecerem no Print!
+        stream_val_y[my_addr - 1] = lux_snap;
+        stream_val_u[my_addr - 1] = u_snap;
+
         if (dist_snap) {
             sendCANNetworkMsg('l', '0', 0, lambda_snap); 
         }
@@ -989,37 +1015,56 @@ void loop() {
         history_idx = (history_idx + 1) % minute_buffer_size;
         hist_cnt++;
 
-        if (stream_active_y[my_addr]) {
-            sendCANNetworkMsg('s', 'y', 0, lux_snap); 
-        }
-        if (stream_active_u[my_addr]) {
-            sendCANNetworkMsg('s', 'u', 0, u_snap);
-        }
-
         if (hist_cnt >= 10) {
           hist_cnt = 0;
           sendCANNetworkMsg('b', 'y', 0, lux_snap);
           sendCANNetworkMsg('b', 'u', 0, u_snap); 
         }
 
-        if (stream_active_y[0]) {
-            Serial.print("Y_ALL\t"); 
-            Serial.print(millis());
-            for(int i = 0; i < num_nodes; i++) {
-                Serial.print("\t"); 
-                Serial.print(stream_val_y[i], 4);
+        // --- SISTEMA DESINCRONIZADO DE ENVIO DOS FOLLOWERS PARA O HUB ---
+        // Se a placa não for o Hub, envia os dados desfazados no tempo para evitar colisão no CAN.
+        if (my_addr != 1) {
+            if (stream_active_y[my_addr]) {
+                delay(my_addr * 5); // [FIX ANTI-COLISAO]: Node 2 espera 10ms, Node 3 espera 15ms
+                sendCANNetworkMsg('s', 'y', 1, lux_snap); 
             }
-            Serial.println();
+            if (stream_active_u[my_addr]) {
+                delay(3); // Pausa minúscula para o MCP2515 respirar entre Y e U
+                sendCANNetworkMsg('s', 'u', 1, u_snap);
+            }
         }
 
-        if (stream_active_u[0]) {
-            Serial.print("U_ALL\t"); 
-            Serial.print(millis());
-            for(int i = 0; i < num_nodes; i++) {
-                Serial.print("\t"); 
-                Serial.print(stream_val_u[i], 4);
+        // --- PRINT DOS DADOS NO ECRÃ (APENAS O HUB FAZ ISTO) ---
+        if (is_hub) {
+            if (stream_active_both) {
+                Serial.print("DATA_ALL\t"); 
+                Serial.print(millis());
+                // Imprime todos os Lux (y1, y2, y3)
+                for(int i = 0; i < num_nodes; i++) {
+                    Serial.print("\t"); Serial.print(stream_val_y[i], 4);
+                }
+                // Imprime todos os PWM (u1, u2, u3)
+                for(int i = 0; i < num_nodes; i++) {
+                    Serial.print("\t"); Serial.print(stream_val_u[i], 4);
+                }
+                Serial.println();
+            } 
+            else {
+                if (stream_active_y[0]) {
+                    Serial.print("Y_ALL\t"); Serial.print(millis());
+                    for(int i = 0; i < num_nodes; i++) {
+                        Serial.print("\t"); Serial.print(stream_val_y[i], 4);
+                    }
+                    Serial.println();
+                }
+                if (stream_active_u[0]) {
+                    Serial.print("U_ALL\t"); Serial.print(millis());
+                    for(int i = 0; i < num_nodes; i++) {
+                        Serial.print("\t"); Serial.print(stream_val_u[i], 4);
+                    }
+                    Serial.println();
+                }
             }
-            Serial.println();
         }
       }
   }
@@ -1036,25 +1081,24 @@ void setup1() {
 void loop1() {
     if (!system_ready) return;
 
-    // 1. The 10 millisecond gate
+    // 1. O Portão de 10 milissegundos
     static unsigned long last_t = 0;
     unsigned long now = millis();
     if (now - last_t < 10) return;  
     last_t += 10;
 
-    // 2. --- CORRECTED ACTUATION JITTER CALCULATION (CORE 1) ---
+    // 2. --- [FIX] CALCULO DO JITTER IGNORANDO CALIBRAÇÃO ---
     static unsigned long last_exec_micros = 0;
     unsigned long now_micros = micros();
     
-    // Only count if the last cycle was less than 20ms ago. 
-    // This prevents the long seconds of calibration from counting as "jitter"!
+    // Só conta jitter se o ciclo anterior foi há menos de 20ms (evita contar os atrasos enormes do Boot)
     if (last_exec_micros > 0 && (now_micros - last_exec_micros < 20000)) {
         unsigned long dt = now_micros - last_exec_micros;
         if (dt > core1_max_dt) core1_max_dt = dt;
         if (dt < core1_min_dt) core1_min_dt = dt;
     }
     last_exec_micros = now_micros;
-    // ----------------------------------------------------------
+    // --------------------------------------------------------
 
     float ramp_speed = 0.04; 
     if (current_setpoint < target_setpoint) {
@@ -1081,6 +1125,7 @@ void loop1() {
     float snap_net_lam[MAX_NODES];
     
     for (int i = 0; i < num_nodes; i++) {
+        // --- [FIX] WATCHDOG / TOLERANCIA A FALHAS ---
         if (i != (my_addr - 1) && (now - last_rx_time[i] > WATCHDOG_TIMEOUT_MS)) {
             snap_net_u[i] = 0.0;
             snap_net_lam[i] = 0.0;
